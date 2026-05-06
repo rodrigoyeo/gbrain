@@ -65,6 +65,46 @@ describe('postgres-engine / search path timeout isolation', () => {
     expect(vector).toMatch(/SET\s+LOCAL\s+statement_timeout/);
   });
 
+  test('searchVector pins hnsw.ef_search = 400 via SET LOCAL inside sql.begin()', () => {
+    // Why this test exists: PgBouncer/Supavisor TRANSACTION-mode pooling
+    // (Supabase pooler port 6543 is the canonical case) does NOT preserve
+    // session-level GUCs across transactions. A `?options=-c hnsw.ef_search=400`
+    // URL parameter is silently reverted to the engine default (40) on every
+    // new transaction-scoped connection checkout. The empirically verified
+    // regression: a deployment that set ef_search=400 via URL options alone
+    // continued to behave as ef_search=40 (top-3 stuck at the lower-recall
+    // level). SET LOCAL inside sql.begin() ties the GUC to THIS transaction
+    // and cannot be stripped by the pooler.
+    //
+    // Scope guard: the patch must live next to the existing SET LOCAL
+    // statement_timeout in the searchVector transaction — searchKeyword and
+    // searchKeywordChunks do NOT use HNSW (tsvector + ts_rank only), so
+    // setting hnsw.ef_search there is harmless but not required.
+    const vector = extractMethod(SRC, 'searchVector');
+    expect(vector).toMatch(/sql`\s*SET\s+LOCAL\s+hnsw\.ef_search\s*=\s*400\s*`/);
+    // Belt-and-suspenders: assert the SET LOCAL is INSIDE the sql.begin()
+    // block, not floating loose where it would either be a no-op outside a
+    // transaction or, worse, leak onto a pooled connection on success.
+    const beginBlock = vector.match(/sql\.begin\s*\(\s*async\s+sql\s*=>\s*\{[\s\S]*?\}\s*\)/);
+    expect(beginBlock).not.toBeNull();
+    expect(beginBlock![0]).toMatch(/SET\s+LOCAL\s+hnsw\.ef_search\s*=\s*400/);
+  });
+
+  test('hnsw.ef_search GUC is NOT set outside a transaction (pooler-leak regression guard)', () => {
+    // Mirror of the existing "no bare SET statement_timeout" guard above:
+    // any bare `sql` SET hnsw.ef_search = ...` ` (not inside sql.begin())
+    // would set the GUC on the pooled session and silently leak ef_search=400
+    // onto whatever transaction the next checkout happens to land in. The
+    // SET LOCAL form is the only safe pattern.
+    const stripped = SRC
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|\s)\/\/[^\n]*/g, '$1');
+    const bare = stripped.match(
+      /sql`\s*SET\s+(?!LOCAL\s)hnsw\.ef_search\b[^`]*`/gi,
+    );
+    expect(bare).toBeNull();
+  });
+
   test('connect() with poolSize honors resolvePrepare (PgBouncer regression guard)', () => {
     // Regression: worker-instance pools were NOT honoring the prepare decision
     // before v0.15.4. Module singleton connect() in db.ts was fixed by #284 but

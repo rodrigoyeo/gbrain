@@ -749,6 +749,26 @@ export class PostgresEngine implements BrainEngine {
 
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
+      // HNSW recall is governed by hnsw.ef_search (Postgres GUC). The library
+      // default is 40 (~89% recall on a typical brain). 400 lifts recall to
+      // ~99% with negligible latency cost (a few ms; vector search is dominated
+      // by the HNSW visiting cost which scales sub-linearly with ef).
+      //
+      // Why SET LOCAL inside sql.begin() instead of `?options=-c hnsw.ef_search=400`
+      // on the connection URL: when the database is reached through a
+      // PgBouncer/Supavisor TRANSACTION-mode pooler (the default for Supabase
+      // pooler port 6543), session-level GUCs set via URL `options=` parameters
+      // are NOT preserved across transaction boundaries — the pooler reuses
+      // the underlying connection for other clients between transactions and
+      // the GUC reverts. SET LOCAL is the only way to guarantee the setting
+      // takes effect for THIS specific search transaction regardless of pooler
+      // mode.
+      //
+      // Empirical evidence: a deployment that set ef_search=400 via URL options
+      // alone showed unchanged HNSW results (top-3 stayed at the ef_search=40
+      // recall level). With SET LOCAL inside sql.begin(), the setting is
+      // applied per transaction and survives transaction-mode pooling.
+      await sql`SET LOCAL hnsw.ef_search = 400`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
