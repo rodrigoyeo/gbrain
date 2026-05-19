@@ -1075,6 +1075,10 @@ export class PostgresEngine implements BrainEngine {
     // to the transaction so it can never leak onto a pooled connection.
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
+      // Arkode downstream recall gate: production search uses pgvector HNSW.
+      // Keep ef_search transaction-local so it survives transaction-mode
+      // poolers such as Supabase/Supavisor and applies only to this query.
+      await sql`SET LOCAL hnsw.ef_search = 400`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
