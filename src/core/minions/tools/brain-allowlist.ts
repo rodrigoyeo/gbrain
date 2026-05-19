@@ -26,6 +26,7 @@ import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { operations } from '../../operations.ts';
 import type { Operation, OperationContext } from '../../operations.ts';
+import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
 
 /**
@@ -56,6 +57,13 @@ export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
   'resolve_slugs',
   'get_ingest_log',
   'put_page',
+  // v0.29 — Salience + Anomaly Detection. Both read-only. `get_recent_transcripts`
+  // is intentionally NOT included: subagent calls always have ctx.remote=true,
+  // and the v0.29 trust gate rejects remote callers — adding it here would be
+  // a footgun (subagent calls op, gets permission_denied, looks like a bug).
+  // The cycle synthesize phase already calls discoverTranscripts directly.
+  'get_recent_salience',
+  'find_anomalies',
 ]);
 
 /** Matches Anthropic's tool-name constraint. No dots. */
@@ -78,12 +86,7 @@ function paramsToInputSchema(op: Operation): Record<string, unknown> {
   return {
     type: 'object' as const,
     properties: Object.fromEntries(
-      Object.entries(op.params).map(([k, v]) => [k, {
-        type: v.type === 'array' ? 'array' : v.type,
-        ...(v.description ? { description: v.description } : {}),
-        ...(v.enum ? { enum: v.enum } : {}),
-        ...(v.items ? { items: { type: v.items.type } } : {}),
-      }]),
+      Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
     ),
     required: Object.entries(op.params).filter(([, v]) => v.required).map(([k]) => k),
   };
@@ -179,6 +182,7 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     },
     dryRun: false,
     remote: true,                // match MCP trust boundary for auto-link skip
+    sourceId: 'default',         // v0.34 D4: required; subagent tools default to host source
     jobId: deps.jobId,
     subagentId: deps.subagentId,
     viaSubagent: true,           // FAIL-CLOSED: put_page etc. enforce namespace

@@ -32,6 +32,80 @@ interface Migration {
    */
   transaction?: boolean;
   handler?: (engine: BrainEngine) => Promise<void>;
+  /**
+   * v0.30.1 (D6): when undefined, treated as `true` for all existing
+   * migrations (every migration in the registry uses CREATE ... IF NOT
+   * EXISTS / ALTER ... IF NOT EXISTS / INSERT ... ON CONFLICT, so re-running
+   * is safe). Explicit `idempotent: false` blocks the verify-hook
+   * self-healing path from re-running a destructive migration; the runner
+   * surfaces `MigrationDriftError` and requires `--skip-verify` to force.
+   *
+   * NEW migrations should declare this explicitly; the CONTRIBUTING
+   * migration template lists it as required for clarity.
+   */
+  idempotent?: boolean;
+  /**
+   * v0.30.1 (D6): post-condition probe. Runs after the migration claims
+   * to have applied. Returns false if the actual schema state doesn't
+   * match what the migration declared (e.g. column/table/index missing
+   * after a partially-committed run on a wedged Supabase pooler).
+   *
+   * Verify-hook coverage is OPT-IN per migration. Per X3 / codex C6 the
+   * v0.30.1 surface ships verify hooks only on a small set of migrations;
+   * older migrations rely on `gbrain upgrade --force-schema` for recovery.
+   */
+  verify?: (engine: BrainEngine) => Promise<boolean>;
+}
+
+/**
+ * Resolve idempotent classification with the v0.30.1 default. Used by the
+ * migration runner's verify path and by the twice-run safety test
+ * (test/migrate-idempotent-classify.test.ts).
+ */
+export function isMigrationIdempotent(m: Migration): boolean {
+  // Default true: existing migrations were authored as idempotent (every
+  // CREATE/ALTER uses IF NOT EXISTS guards). Explicit false opts out.
+  return m.idempotent !== false;
+}
+
+/**
+ * Migration drift error — verify hook failed and migration is non-idempotent.
+ * Caller surfaces the column/table names that diverged and requires
+ * `--skip-verify` to force re-run.
+ */
+export class MigrationDriftError extends Error {
+  constructor(
+    public readonly version: number,
+    public readonly migrationName: string,
+    public readonly hint: string,
+  ) {
+    super(`Migration v${version} (${migrationName}) verify failed: ${hint}`);
+    this.name = 'MigrationDriftError';
+  }
+}
+
+/**
+ * Retry-exhausted envelope (v0.30.1 / Finding F2). Surface the most recent
+ * idle blockers we observed so the user has a paste-ready
+ * pg_terminate_backend(<pid>) command.
+ */
+export class MigrationRetryExhausted extends Error {
+  constructor(
+    public readonly version: number,
+    public readonly migrationName: string,
+    public readonly attempts: number,
+    public readonly lastBlockers: IdleBlocker[],
+    public readonly lastError: Error,
+  ) {
+    const lastB = lastBlockers[0];
+    const hint = lastB
+      ? `PID ${lastB.pid} idle since ${lastB.query_start} likely holds the lock; run: psql ... -c "SELECT pg_terminate_backend(${lastB.pid})"`
+      : 'No idle-in-transaction blockers detected; check pg_locks for active waiters and ~/.gbrain/audit/connection-events-*.jsonl';
+    super(
+      `Migration v${version} (${migrationName}) failed after ${attempts} attempts. ${hint}. Original: ${lastError.message}`
+    );
+    this.name = 'MigrationRetryExhausted';
+  }
 }
 
 // Migrations are embedded here, not loaded from files.
@@ -519,6 +593,25 @@ export const MIGRATIONS: Migration[] = [
           ALTER TABLE files ADD COLUMN IF NOT EXISTS source_id TEXT
             NOT NULL DEFAULT 'default' REFERENCES sources(id) ON DELETE CASCADE;
           CREATE INDEX IF NOT EXISTS idx_files_source_id ON files(source_id);
+
+          -- 1a'. Defensive FK repair. ALTER TABLE ADD COLUMN IF NOT EXISTS is a
+          --      no-op when the column already exists, so the inline FK never
+          --      re-adds. Some test paths (notably postgres-bootstrap.test.ts)
+          --      drop the sources table CASCADE which removes
+          --      files_source_id_fkey while leaving files.source_id intact.
+          --      Without this block the FK would never come back on upgrade,
+          --      and CASCADE-on-source-delete silently stops working.
+          DO $$ BEGIN
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'files_source_id_fkey'
+                AND conrelid = 'files'::regclass
+            ) THEN
+              ALTER TABLE files
+                ADD CONSTRAINT files_source_id_fkey
+                FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE;
+            END IF;
+          END $$;
 
           -- 1b. page_id (nullable; pre-v0.17 files pointed at page_slug
           --     which was ON DELETE SET NULL, so we keep the same nullable
@@ -1073,6 +1166,160 @@ export const MIGRATIONS: Migration[] = [
     },
     sql: '',
   },
+  // NOTE: v37 + v38 are the v0.28 takes migrations. Renumbered four times during
+  // the long-lived v0.28 branch as master shipped:
+  //   v0.28 originally targeted v31/v32
+  //   master v0.25 claimed v31 (eval_capture_tables) → renumbered to v32/v33
+  //   master v0.26 claimed v32 (oauth_infrastructure) and v33
+  //     (admin_dashboard_columns_v0_26_3) → renumbered to v34/v35
+  //   master v0.26.5 claimed v34 (destructive_guard_columns) → renumbered to v35/v36
+  //   master v0.26.8 + v0.27 claimed v35 (auto_rls_event_trigger) and v36
+  //     (subagent_provider_neutral_persistence_v0_27) → renumbered to v37/v38
+  // Runtime sort by version ascending means source-order doesn't matter.
+  {
+    version: 37,
+    name: 'takes_and_synthesis_evidence',
+    // v0.28: typed/weighted/attributed claims ("takes") + synthesis provenance.
+    // Spec: docs/designs (CEO plan) + plan file. Schema decisions:
+    //   - page_id FK (not page_slug) — pages.slug is unique only within source
+    //   - (page_id, row_num) is the natural unique key (composite, append-only)
+    //   - synthesis_evidence FK ON DELETE CASCADE — when a source take is hard-deleted,
+    //     provenance rows go with it; synthesis renderer marks citations as removed
+    //   - HNSW index on embedding (pgvector 0.7+ supports both Postgres + PGLite)
+    //   - resolved_* columns ship now per CEO-review D4 + Codex P1 #13 (immutable)
+    sql: `
+      CREATE TABLE IF NOT EXISTS takes (
+        id               BIGSERIAL PRIMARY KEY,
+        page_id          INTEGER     NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        row_num          INTEGER     NOT NULL,
+        claim            TEXT        NOT NULL,
+        kind             TEXT        NOT NULL CHECK (kind IN ('fact','take','bet','hunch')),
+        holder           TEXT        NOT NULL,
+        weight           REAL        NOT NULL DEFAULT 0.5 CHECK (weight >= 0 AND weight <= 1),
+        since_date       TEXT,
+        until_date       TEXT,
+        source           TEXT,
+        superseded_by    INTEGER,
+        active           BOOLEAN     NOT NULL DEFAULT TRUE,
+        resolved_at      TIMESTAMPTZ,
+        resolved_outcome BOOLEAN,
+        resolved_value   REAL,
+        resolved_unit    TEXT,
+        resolved_source  TEXT,
+        resolved_by      TEXT,
+        embedding        VECTOR(1536),
+        embedded_at      TIMESTAMPTZ,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT takes_page_row_key UNIQUE (page_id, row_num)
+      );
+      CREATE INDEX IF NOT EXISTS idx_takes_page          ON takes(page_id);
+      CREATE INDEX IF NOT EXISTS idx_takes_kind_active   ON takes(kind)   WHERE active;
+      CREATE INDEX IF NOT EXISTS idx_takes_holder_active ON takes(holder) WHERE active;
+      CREATE INDEX IF NOT EXISTS idx_takes_weight_active ON takes(weight DESC) WHERE active;
+      CREATE INDEX IF NOT EXISTS idx_takes_resolved_at   ON takes(resolved_at) WHERE resolved_at IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_takes_embedding_hnsw ON takes
+        USING hnsw (embedding vector_cosine_ops)
+        WHERE active AND embedding IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS synthesis_evidence (
+        synthesis_page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        take_page_id      INTEGER NOT NULL,
+        take_row_num      INTEGER NOT NULL,
+        citation_index    INTEGER NOT NULL,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (synthesis_page_id, take_page_id, take_row_num),
+        FOREIGN KEY (take_page_id, take_row_num)
+          REFERENCES takes(page_id, row_num) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_synthesis_evidence_take
+        ON synthesis_evidence(take_page_id, take_row_num);
+
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE takes              ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE synthesis_evidence ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+    `,
+    sqlFor: {
+      // PGLite: same DDL minus the RLS DO-block (no rolbypassrls). Same HNSW
+      // index syntax — pgvector 0.7+ supports it. Same FK semantics.
+      pglite: `
+        CREATE TABLE IF NOT EXISTS takes (
+          id               BIGSERIAL PRIMARY KEY,
+          page_id          INTEGER     NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+          row_num          INTEGER     NOT NULL,
+          claim            TEXT        NOT NULL,
+          kind             TEXT        NOT NULL CHECK (kind IN ('fact','take','bet','hunch')),
+          holder           TEXT        NOT NULL,
+          weight           REAL        NOT NULL DEFAULT 0.5 CHECK (weight >= 0 AND weight <= 1),
+          since_date       TEXT,
+          until_date       TEXT,
+          source           TEXT,
+          superseded_by    INTEGER,
+          active           BOOLEAN     NOT NULL DEFAULT TRUE,
+          resolved_at      TIMESTAMPTZ,
+          resolved_outcome BOOLEAN,
+          resolved_value   REAL,
+          resolved_unit    TEXT,
+          resolved_source  TEXT,
+          resolved_by      TEXT,
+          embedding        VECTOR(1536),
+          embedded_at      TIMESTAMPTZ,
+          created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CONSTRAINT takes_page_row_key UNIQUE (page_id, row_num)
+        );
+        CREATE INDEX IF NOT EXISTS idx_takes_page          ON takes(page_id);
+        CREATE INDEX IF NOT EXISTS idx_takes_kind_active   ON takes(kind)   WHERE active;
+        CREATE INDEX IF NOT EXISTS idx_takes_holder_active ON takes(holder) WHERE active;
+        CREATE INDEX IF NOT EXISTS idx_takes_weight_active ON takes(weight DESC) WHERE active;
+        CREATE INDEX IF NOT EXISTS idx_takes_resolved_at   ON takes(resolved_at) WHERE resolved_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_takes_embedding_hnsw ON takes
+          USING hnsw (embedding vector_cosine_ops)
+          WHERE active AND embedding IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS synthesis_evidence (
+          synthesis_page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+          take_page_id      INTEGER NOT NULL,
+          take_row_num      INTEGER NOT NULL,
+          citation_index    INTEGER NOT NULL,
+          created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (synthesis_page_id, take_page_id, take_row_num),
+          FOREIGN KEY (take_page_id, take_row_num)
+            REFERENCES takes(page_id, row_num) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_synthesis_evidence_take
+          ON synthesis_evidence(take_page_id, take_row_num);
+      `,
+    },
+  },
+  {
+    version: 38,
+    name: 'access_tokens_permissions',
+    // v0.28: per-token allow-list for takes visibility (Codex P0 #3 partial fix).
+    // The complementary fix (chunker strips fenced takes content from page chunks
+    // so query results don't bypass the allow-list) lives in src/core/chunkers/takes-strip.ts.
+    // Default permissions = {takes_holders: ['world']} keeps non-world takes (hunches,
+    // private opinions) hidden from MCP-bound tokens until the operator explicitly
+    // grants access via `gbrain auth permissions <id> set-takes-holders`.
+    sql: `
+      ALTER TABLE access_tokens
+        ADD COLUMN IF NOT EXISTS permissions JSONB
+          NOT NULL DEFAULT '{"takes_holders":["world"]}'::jsonb;
+
+      -- Backfill existing tokens to the default. NOT NULL DEFAULT covers new rows;
+      -- this UPDATE handles any pre-existing rows from before the column was added.
+      UPDATE access_tokens
+        SET permissions = '{"takes_holders":["world"]}'::jsonb
+        WHERE permissions IS NULL OR permissions = '{}'::jsonb;
+    `,
+  },
   {
     version: 30,
     name: 'dream_verdicts_table',
@@ -1535,6 +1782,1770 @@ export const MIGRATIONS: Migration[] = [
         ON subagent_messages (job_id, provider_id);
     `,
   },
+  {
+    version: 39,
+    name: 'multimodal_dual_column_v0_27_1',
+    // v0.27.1 multimodal ingestion. Three changes that travel together:
+    //
+    // 1. content_chunks gains `modality TEXT NOT NULL DEFAULT 'text'` so image
+    //    chunks declare themselves at the row level. Search filters use it to
+    //    keep image OCR text out of text-page keyword search by default.
+    //
+    // 2. content_chunks gains `embedding_image vector(1024)` for Voyage
+    //    multimodal embeddings. NULL on every text row; sparse on the column.
+    //    Partial HNSW index ignores NULL rows so the index footprint stays
+    //    proportional to image chunk count, not table size. Mixed-provider
+    //    brains (e.g. OpenAI 1536 text + Voyage 1024 images) can keep both
+    //    columns populated with distinct dim spaces.
+    //
+    // 3. PGLite gains the `files` table (mirroring the Postgres v0.18 shape)
+    //    so the multimodal ingest pipeline can persist binary-asset metadata
+    //    on the default engine. Image bytes never enter the DB; storage_path
+    //    references a path inside the brain repo. The v0.18 "PGLite has no
+    //    files table" omission was specific to blob storage — for path-
+    //    referenced metadata PGLite hosts it fine.
+    //
+    // Eng-3C: a preflight handler refuses if pgvector < 0.5, BEFORE any DDL
+    // fires, so the user gets a clear upgrade hint instead of a half-migrated
+    // brain mid-DDL. Postgres-only — PGLite ships pgvector built in.
+    // Handler-driven migration. The preflight pgvector check (Eng-3C) MUST
+    // run BEFORE any DDL fires; if we used `sqlFor` the runner would DDL
+    // before calling the handler. So we keep `sql` empty and let the handler
+    // run preflight + DDL in the right order.
+    sql: '',
+    handler: async (engine: BrainEngine) => {
+      // Eng-3C: refuse loudly if pgvector < 0.5 BEFORE any DDL fires.
+      // Partial HNSW indexes need HNSW (pgvector 0.5.0+). PGLite ships a
+      // recent pgvector inside its WASM bundle so this gate is Postgres-only.
+      if (engine.kind === 'postgres') {
+        const rows = await engine.executeRaw<{ extversion: string }>(
+          `SELECT extversion FROM pg_extension WHERE extname = 'vector'`
+        );
+        if (rows.length === 0) {
+          throw new Error(
+            `Migration v39 requires the pgvector extension. Install it via\n` +
+            `  CREATE EXTENSION vector;\n` +
+            `then re-run \`gbrain apply-migrations --yes\`.`
+          );
+        }
+        const version = rows[0].extversion;
+        const [maj, minStr] = version.split('.');
+        const min = parseInt(minStr ?? '0', 10);
+        const major = parseInt(maj ?? '0', 10);
+        if (major === 0 && min < 5) {
+          throw new Error(
+            `Migration v39 requires pgvector >= 0.5.0 (HNSW partial indexes).\n` +
+            `Found pgvector ${version}.\n\n` +
+            `Fix: ALTER EXTENSION vector UPDATE; then re-run \`gbrain apply-migrations --yes\`.\n` +
+            `If your Postgres provider doesn't ship pgvector >= 0.5, request\n` +
+            `an upgrade or migrate to PGLite for v0.27.1 multimodal support.`
+          );
+        }
+      }
+
+      // Step 1: schema delta on content_chunks + widen pages.page_kind CHECK
+      // to admit 'image'. Runs through engine.runMigration so multi-statement
+      // DDL works on PGLite (db.exec) and Postgres (sql.unsafe).
+      await engine.runMigration(39, `
+        ALTER TABLE content_chunks
+          ADD COLUMN IF NOT EXISTS modality TEXT NOT NULL DEFAULT 'text',
+          ADD COLUMN IF NOT EXISTS embedding_image vector(1024);
+
+        CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
+          ON content_chunks USING hnsw (embedding_image vector_cosine_ops)
+          WHERE embedding_image IS NOT NULL;
+
+        -- Widen pages.page_kind CHECK to admit 'image'. The constraint name
+        -- is auto-assigned by Postgres; locate + drop + recreate with the
+        -- new value list. PGLite + Postgres share the same constraint shape.
+        ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_page_kind_check;
+        ALTER TABLE pages ADD CONSTRAINT pages_page_kind_check
+          CHECK (page_kind IN ('markdown','code','image'));
+      `);
+
+      // Step 2: PGLite-only — add the files table that v0.18 deliberately
+      // omitted. Postgres has had it since v0.18; this is parity catch-up.
+      if (engine.kind === 'pglite') {
+        await engine.runMigration(39, `
+          CREATE TABLE IF NOT EXISTS files (
+            id           SERIAL PRIMARY KEY,
+            source_id    TEXT   NOT NULL DEFAULT 'default'
+                         REFERENCES sources(id) ON DELETE CASCADE,
+            page_slug    TEXT,
+            page_id      INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+            filename     TEXT   NOT NULL,
+            storage_path TEXT   NOT NULL,
+            mime_type    TEXT,
+            size_bytes   BIGINT,
+            content_hash TEXT   NOT NULL,
+            metadata     JSONB  NOT NULL DEFAULT '{}',
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE(storage_path)
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_files_page ON files(page_slug);
+          CREATE INDEX IF NOT EXISTS idx_files_page_id ON files(page_id);
+          CREATE INDEX IF NOT EXISTS idx_files_source_id ON files(source_id);
+          CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
+        `);
+      }
+    },
+  },
+  {
+    version: 40,
+    name: 'pages_emotional_weight',
+    // v0.29 — Salience + Anomaly Detection.
+    //
+    // Adds the `emotional_weight` column to pages. Populated by the new
+    // `recompute_emotional_weight` cycle phase from tags + takes (deterministic;
+    // no LLM). Default 0.0 so freshly imported pages don't pollute salience
+    // ranking before the cycle has run; users run `gbrain dream --phase
+    // recompute_emotional_weight` once after upgrading to backfill.
+    //
+    // No index: the salience query orders by a computed score (emotional_weight,
+    // take_count, recency-decay), not by raw emotional_weight. Add an index
+    // later only if a query orders by the raw column directly.
+    //
+    // Postgres ADD COLUMN with a constant DEFAULT is metadata-only on PG 11+
+    // and PGLite (PG 17.5 via WASM) — instant on tables of any size.
+    sql: `
+      ALTER TABLE pages
+        ADD COLUMN IF NOT EXISTS emotional_weight REAL NOT NULL DEFAULT 0.0;
+    `,
+  },
+  {
+    version: 41,
+    name: 'pages_recency_columns',
+    sql: '',
+    // v0.29.1 — Salience-and-Recency, additive opt-in.
+    //
+    // Four new pages columns (all nullable, additive only, no behavior change
+    // in the default search path; only consulted when a caller opts into
+    // `salience='on'` / `recency='on'` or the new `since`/`until` filter):
+    //
+    //   effective_date         — content date (event_date / date / published /
+    //                            filename-date / fallback). Read by the new
+    //                            recency boost and date-filter paths only.
+    //                            Auto-link doesn't touch it (immune to
+    //                            updated_at churn).
+    //   effective_date_source  — sentinel for the doctor's effective_date_health
+    //                            check ('event_date' | 'date' | 'published' |
+    //                            'filename' | 'fallback'). The 'fallback' value
+    //                            is what surfaces "page that fell back to
+    //                            updated_at when frontmatter was unparseable".
+    //   import_filename        — basename without extension, captured at import.
+    //                            computeEffectiveDate uses it for filename-date
+    //                            precedence (daily/, meetings/ prefixes). Older
+    //                            rows leave it NULL; backfill falls through.
+    //   salience_touched_at    — bumped by recompute_emotional_weight when
+    //                            emotional_weight changes. Salience window
+    //                            uses GREATEST(updated_at, salience_touched_at)
+    //                            so newly-salient old pages enter the recent
+    //                            salience query.
+    //
+    // Plus an expression index used by since/until filters that read
+    // COALESCE(effective_date, updated_at). Partial-index claim from earlier
+    // plan iterations was wrong (codex pass-2 #15) — the planner won't use a
+    // partial index for the negative side of a COALESCE; expression index does.
+    //
+    // CONCURRENTLY + pre-drop guard (mirror of v34) on Postgres; plain CREATE
+    // INDEX on PGLite via the handler branching on engine.kind.
+    handler: async (engine) => {
+      // 1. ADD COLUMN x4. ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent.
+      //    No defaults, all nullable, all metadata-only on PG 11+ and PGLite.
+      await engine.runMigration(38, `
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS effective_date        TIMESTAMPTZ;
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS effective_date_source TEXT;
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS import_filename       TEXT;
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS salience_touched_at   TIMESTAMPTZ;
+      `);
+
+      // 2. Expression index for since/until date-range filters.
+      if (engine.kind === 'postgres') {
+        // Pre-drop any invalid index from a prior CONCURRENTLY failure.
+        await engine.runMigration(38, `
+          DO $$ BEGIN
+            IF EXISTS (
+              SELECT 1 FROM pg_index i
+              JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname = 'pages_coalesce_date_idx' AND NOT i.indisvalid
+            ) THEN
+              EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS pages_coalesce_date_idx';
+            END IF;
+          END $$;
+        `);
+        await engine.runMigration(38, `
+          CREATE INDEX CONCURRENTLY IF NOT EXISTS pages_coalesce_date_idx
+            ON pages ((COALESCE(effective_date, updated_at)));
+        `);
+      } else {
+        await engine.runMigration(38, `
+          CREATE INDEX IF NOT EXISTS pages_coalesce_date_idx
+            ON pages ((COALESCE(effective_date, updated_at)));
+        `);
+      }
+    },
+    // CONCURRENTLY on Postgres requires no surrounding transaction.
+    transaction: false,
+  },
+  {
+    version: 42,
+    name: 'eval_candidates_recency_capture',
+    // v0.29.1 — capture agent-explicit recency + salience choices for replay
+    // reproducibility (D11 codex resolution).
+    //
+    // Without these fields, `gbrain eval replay` cannot reproduce a captured
+    // run: the live behavior depends on the resolved {salience, recency}
+    // values, which are absent from v0.29.0's eval_candidates schema. Replays
+    // of agent-explicit choices drift the same way as_of_ts replays drifted
+    // before being captured.
+    //
+    // All columns are nullable + additive. Pre-v0.29.1 rows stay valid. The
+    // NDJSON `schema_version` STAYS at 1 — the new fields are optional, and
+    // gbrain-evals consumers that don't know about them ignore them
+    // (standard permissive deserialization). No cross-repo coordination
+    // required (codex pass-1 #C2 dissolved).
+    //
+    //   as_of_ts            — brain's logical NOW at capture (replay uses
+    //                         this instead of wall-clock so old captures
+    //                         reproduce identically against today's brain).
+    //   salience_param      — what the caller passed (or NULL if omitted).
+    //   recency_param       — same for recency.
+    //   salience_resolved   — final value applied ('off' / 'on' / 'strong').
+    //   recency_resolved    — same for recency.
+    //   salience_source     — 'caller' or 'auto_heuristic'.
+    //   recency_source      — same for recency.
+    //
+    // ADD COLUMN with no DEFAULT is metadata-only on PG 11+ and PGLite —
+    // instant on tables of any size.
+    sql: `
+      ALTER TABLE eval_candidates ADD COLUMN IF NOT EXISTS as_of_ts          TIMESTAMPTZ;
+      ALTER TABLE eval_candidates ADD COLUMN IF NOT EXISTS salience_param    TEXT;
+      ALTER TABLE eval_candidates ADD COLUMN IF NOT EXISTS recency_param     TEXT;
+      ALTER TABLE eval_candidates ADD COLUMN IF NOT EXISTS salience_resolved TEXT;
+      ALTER TABLE eval_candidates ADD COLUMN IF NOT EXISTS recency_resolved  TEXT;
+      ALTER TABLE eval_candidates ADD COLUMN IF NOT EXISTS salience_source   TEXT;
+      ALTER TABLE eval_candidates ADD COLUMN IF NOT EXISTS recency_source    TEXT;
+    `,
+  },
+  {
+    version: 43,
+    name: 'takes_resolved_quality_and_drift_decisions',
+    // v0.30.0 (Slice A1, Universal Takes Epistemology wave). Bundles ALL schema
+    // for the v0.30 release wave so A2/B1/C1 add no migrations (codex F6 fix:
+    // schema-first ordering eliminates the cross-lane migrate.ts contention).
+    // Originally landed as v40 in the v0.30.0 branch; renumbered to v43 on
+    // merge with master after master claimed v40-v42 with the v0.29 +
+    // v0.29.1 salience-and-recency wave. Migration runner sorts by version
+    // number, so renumbering is a pure-rename — no semantic change.
+    //
+    // 1. takes.resolved_quality TEXT — 3-state outcome label (correct/incorrect/
+    //    partial) sitting alongside existing resolved_outcome BOOLEAN. Boolean
+    //    stays for back-compat reads; quality is the new source of truth for
+    //    calibration math. Backfill maps legacy resolved_outcome → quality.
+    //
+    // 2. takes_resolution_consistency CHECK constraint — fails contradictory
+    //    states like (quality='correct', outcome=false). 'partial' maps to
+    //    outcome=NULL because partial isn't a binary outcome. Added AFTER the
+    //    backfill so existing rows pass.
+    //
+    // 3. idx_takes_scorecard partial index on (holder, kind, resolved_quality)
+    //    WHERE resolved_quality IS NOT NULL — scorecard hot path. ~5KB on a
+    //    50K-row brain; makes scorecard O(log n) instead of full scan.
+    //
+    // 4. drift_decisions audit table — consumed by Slice C1 (v0.30.3) when
+    //    drift LLM judge ships. Defined here so C1 carries no migration.
+    //    Sized for one row per drift recommendation (insert-only, never
+    //    updated except for applied_at/applied_by when --auto-update lands).
+    sql: `
+      -- Step 1: add resolved_quality column with kind-of-outcome CHECK.
+      -- The (quality, outcome) consistency constraint comes AFTER the backfill
+      -- (Step 3) so existing legacy rows don't fail the new constraint.
+      ALTER TABLE takes
+        ADD COLUMN IF NOT EXISTS resolved_quality TEXT
+          CHECK (resolved_quality IS NULL OR resolved_quality IN ('correct','incorrect','partial'));
+
+      -- Step 2: backfill from legacy boolean. Idempotent: only writes rows
+      -- where quality is still NULL and outcome is set. Re-runs are no-ops.
+      UPDATE takes
+      SET resolved_quality = CASE resolved_outcome
+        WHEN true  THEN 'correct'
+        WHEN false THEN 'incorrect'
+      END
+      WHERE resolved_outcome IS NOT NULL AND resolved_quality IS NULL;
+
+      -- Step 3: (quality, outcome) consistency constraint. Drop-then-recreate
+      -- so re-runs converge. The named constraint lets us evolve it later.
+      ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolution_consistency;
+      ALTER TABLE takes ADD CONSTRAINT takes_resolution_consistency CHECK (
+        (resolved_quality IS NULL     AND resolved_outcome IS NULL)
+        OR (resolved_quality = 'correct'   AND resolved_outcome = true)
+        OR (resolved_quality = 'incorrect' AND resolved_outcome = false)
+        OR (resolved_quality = 'partial'   AND resolved_outcome IS NULL)
+      );
+
+      -- Step 4: scorecard hot path. Partial index keeps footprint proportional
+      -- to resolved-take count, not table size.
+      CREATE INDEX IF NOT EXISTS idx_takes_scorecard
+        ON takes (holder, kind, resolved_quality)
+        WHERE resolved_quality IS NOT NULL;
+
+      -- Step 5: drift_decisions audit table (consumed by Slice C1 in v0.30.3).
+      CREATE TABLE IF NOT EXISTS drift_decisions (
+        id                  BIGSERIAL   PRIMARY KEY,
+        take_id             BIGINT      NOT NULL REFERENCES takes(id) ON DELETE CASCADE,
+        page_id             INTEGER     NOT NULL,
+        row_num             INTEGER     NOT NULL,
+        recommended_weight  REAL        NOT NULL CHECK (recommended_weight >= 0 AND recommended_weight <= 1),
+        reasoning           TEXT,
+        decided_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        applied_at          TIMESTAMPTZ,
+        applied_by          TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_drift_decisions_take       ON drift_decisions(take_id);
+      CREATE INDEX IF NOT EXISTS idx_drift_decisions_decided_at ON drift_decisions(decided_at DESC);
+
+      -- RLS for the new table (Postgres-only — PGLite has no RLS engine).
+      -- Mirrors the v37 takes/synthesis_evidence pattern: only flip RLS on
+      -- when running as a BYPASSRLS role so non-BYPASSRLS apps still read.
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE drift_decisions ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+    `,
+    sqlFor: {
+      // PGLite: same DDL minus the RLS DO-block. Single-tenant by definition.
+      pglite: `
+        ALTER TABLE takes
+          ADD COLUMN IF NOT EXISTS resolved_quality TEXT
+            CHECK (resolved_quality IS NULL OR resolved_quality IN ('correct','incorrect','partial'));
+
+        UPDATE takes
+        SET resolved_quality = CASE resolved_outcome
+          WHEN true  THEN 'correct'
+          WHEN false THEN 'incorrect'
+        END
+        WHERE resolved_outcome IS NOT NULL AND resolved_quality IS NULL;
+
+        ALTER TABLE takes DROP CONSTRAINT IF EXISTS takes_resolution_consistency;
+        ALTER TABLE takes ADD CONSTRAINT takes_resolution_consistency CHECK (
+          (resolved_quality IS NULL     AND resolved_outcome IS NULL)
+          OR (resolved_quality = 'correct'   AND resolved_outcome = true)
+          OR (resolved_quality = 'incorrect' AND resolved_outcome = false)
+          OR (resolved_quality = 'partial'   AND resolved_outcome IS NULL)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_takes_scorecard
+          ON takes (holder, kind, resolved_quality)
+          WHERE resolved_quality IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS drift_decisions (
+          id                  BIGSERIAL   PRIMARY KEY,
+          take_id             BIGINT      NOT NULL REFERENCES takes(id) ON DELETE CASCADE,
+          page_id             INTEGER     NOT NULL,
+          row_num             INTEGER     NOT NULL,
+          recommended_weight  REAL        NOT NULL CHECK (recommended_weight >= 0 AND recommended_weight <= 1),
+          reasoning           TEXT,
+          decided_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+          applied_at          TIMESTAMPTZ,
+          applied_by          TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_drift_decisions_take       ON drift_decisions(take_id);
+        CREATE INDEX IF NOT EXISTS idx_drift_decisions_decided_at ON drift_decisions(decided_at DESC);
+      `,
+    },
+  },
+  {
+    version: 44,
+    name: 'pages_emotional_weight_recomputed_at',
+    idempotent: true,
+    // v0.30.1 (Codex X4 / Finding P2): emotional_weight = 0 is a VALID
+    // steady-state value (migration v40 default). Indexing WHERE = 0
+    // would be a permanent large index over normal data, not a backlog
+    // index. The actual backlog predicate is "never recomputed" — for
+    // that we need a separate timestamp column. ADD COLUMN with NULL
+    // default is metadata-only on PG 11+ and PGLite — instant on tables
+    // of any size.
+    //
+    // The recompute-emotional-weight cycle phase + the new
+    // `gbrain backfill emotional_weight` command both stamp this column
+    // with NOW() alongside the weight write, so existing rows progress
+    // out of the backlog naturally as the cycle runs.
+    //
+    // Partial index: idx_pages_emotional_weight_pending lives on
+    // `(id) WHERE emotional_weight_recomputed_at IS NULL` and is created
+    // on first run by the backfill primitive (CONCURRENTLY) rather than
+    // here, because schema-time CREATE INDEX isn't CONCURRENTLY-friendly
+    // when the SCHEMA_SQL replay runs in a transaction.
+    sql: `
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS emotional_weight_recomputed_at TIMESTAMPTZ;
+    `,
+  },
+  {
+    version: 45,
+    name: 'facts_hot_memory_v0_31',
+    // v0.31: hot memory layer — real-time working memory queryable across
+    // sessions. Sits alongside `takes` (cold, markdown-mirrored) as the
+    // ephemeral DB-only counterpart. Dream cycle's new `consolidate` phase
+    // promotes facts → takes(kind='fact') overnight; the consolidated_into
+    // pointer keeps facts as the audit trail.
+    //
+    // Schema decisions (from /plan-eng-review):
+    //   - source_id TEXT (sources.id is TEXT — eE2). Per-source isolation;
+    //     cross-brain federation stays agent-side.
+    //   - kind CHECK constraint with 5 values; different decay halflives.
+    //   - visibility column mirrors takes' world-default ACL contract (D21).
+    //   - embedding column dim resolved at migration time from the
+    //     `config.embedding_dimensions` row (matches content_chunks dim) so
+    //     non-OpenAI brains (Voyage, etc.) work — codex F6 fix.
+    //   - HALFVEC preferred (pgvector >= 0.7 needed); falls back to VECTOR
+    //     with stderr warn on older pgvector — codex eE6 fix.
+    //   - 5 partial indexes leading on source_id so every read uses the
+    //     trust boundary as part of the index, not a callback.
+    //   - consolidated_into BIGINT — takes.id is BIGSERIAL.
+    sql: '',
+    handler: async (engine: BrainEngine) => {
+      // Step 1: resolve embedding dim from config table (already populated
+      // by the schema-init __EMBEDDING_DIMS__ replacement on PGLite, or by
+      // the seed config on Postgres). Default to 1536 (OpenAI text-embed-3-large).
+      let embeddingDim = 1536;
+      try {
+        const dimRows = await engine.executeRaw<{ value: string }>(
+          `SELECT value FROM config WHERE key = 'embedding_dimensions'`,
+        );
+        if (dimRows.length > 0) {
+          const parsed = parseInt(dimRows[0].value, 10);
+          if (Number.isFinite(parsed) && parsed > 0 && parsed <= 4096) {
+            embeddingDim = parsed;
+          }
+        }
+      } catch {
+        // No config row yet — fall back to default. Fresh installs hit this
+        // path on first initSchema; that's fine since the schema seeds
+        // the row before subsequent migrations run.
+      }
+
+      // Step 2: pgvector version preflight for HALFVEC support (>=0.7).
+      // PGLite ships a recent pgvector inside its WASM bundle; we still
+      // probe to be honest about the column type.
+      let useHalfvec = false;
+      if (engine.kind === 'postgres') {
+        try {
+          const vrows = await engine.executeRaw<{ extversion: string }>(
+            `SELECT extversion FROM pg_extension WHERE extname = 'vector'`,
+          );
+          if (vrows.length === 0) {
+            throw new Error(
+              `Migration v40 (facts hot memory) requires the pgvector extension. ` +
+              `Install it via\n  CREATE EXTENSION vector;\n` +
+              `then re-run \`gbrain apply-migrations --yes\`.`,
+            );
+          }
+          const v = vrows[0].extversion;
+          const parts = v.split('.');
+          const major = parseInt(parts[0] ?? '0', 10);
+          const minor = parseInt(parts[1] ?? '0', 10);
+          // HALFVEC introduced in pgvector 0.7.0
+          if (major > 0 || (major === 0 && minor >= 7)) {
+            useHalfvec = true;
+          } else {
+            // Fall back to full-precision vector with stderr warning.
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[v40 facts] pgvector ${v} < 0.7 — falling back to VECTOR(${embeddingDim}). ` +
+              `HALFVEC space savings unavailable; functionality otherwise identical. ` +
+              `Upgrade pgvector to 0.7+ to enable HALFVEC.`,
+            );
+          }
+        } catch (err) {
+          // Re-throw the missing-extension error; tolerate other probe failures.
+          if (err instanceof Error && err.message.includes('requires the pgvector')) throw err;
+          // Probe failed for other reason — assume older pgvector and fall back.
+        }
+      } else {
+        // PGLite: bundled pgvector is recent enough for HALFVEC. Use it.
+        useHalfvec = true;
+      }
+
+      const vecType = useHalfvec ? 'HALFVEC' : 'VECTOR';
+      // HNSW operator class must match the column type:
+      //   VECTOR(n)  → vector_cosine_ops
+      //   HALFVEC(n) → halfvec_cosine_ops
+      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+      // FK to sources is added in a separate ALTER TABLE rather than inline
+      // on the column. Inline `REFERENCES` worked on PGLite but silently
+      // got dropped by postgres.js's `unsafe()` multi-statement path on
+      // Postgres in the v0.31 e2e run (table created without FK; CASCADE
+      // delete didn't fire). Splitting the FK declaration out makes the
+      // intent explicit and idempotent: the named constraint either
+      // exists or doesn't, and the ALTER is a no-op on re-runs.
+      const factsDDL = `
+        CREATE TABLE IF NOT EXISTS facts (
+          id                BIGSERIAL PRIMARY KEY,
+          source_id         TEXT        NOT NULL DEFAULT 'default',
+          entity_slug       TEXT,
+          fact              TEXT        NOT NULL,
+          kind              TEXT        NOT NULL DEFAULT 'fact'
+                            CHECK (kind IN ('event','preference','commitment','belief','fact')),
+          visibility        TEXT        NOT NULL DEFAULT 'private'
+                            CHECK (visibility IN ('private','world')),
+          notability        TEXT        NOT NULL DEFAULT 'medium'
+                            CHECK (notability IN ('high','medium','low')),
+          context           TEXT,
+          valid_from        TIMESTAMPTZ NOT NULL DEFAULT now(),
+          valid_until       TIMESTAMPTZ,
+          expired_at        TIMESTAMPTZ,
+          superseded_by     BIGINT      REFERENCES facts(id),
+          consolidated_at   TIMESTAMPTZ,
+          consolidated_into BIGINT,
+          source            TEXT        NOT NULL,
+          source_session    TEXT,
+          confidence        REAL        NOT NULL DEFAULT 1.0
+                            CHECK (confidence BETWEEN 0 AND 1),
+          embedding         ${vecType}(${embeddingDim}),
+          embedded_at       TIMESTAMPTZ,
+          created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+          -- v0.32.2 (migration v51): fence round-trip columns. Both nullable
+          -- because pre-v0.32 rows didn't have them; the v0_32_2 orchestrator
+          -- backfills via fence-append. New rows from the markdown-first
+          -- runFactsBackstop/runFactsPipeline paths populate them at insert
+          -- time. The partial unique index below enforces (source_id,
+          -- source_markdown_slug, row_num) uniqueness only once row_num is
+          -- set, so legacy NULL rows don't collide with each other or block
+          -- the backfill.
+          row_num               INTEGER,
+          source_markdown_slug  TEXT
+        );
+
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'facts_source_id_fkey'
+              AND conrelid = 'facts'::regclass
+          ) THEN
+            ALTER TABLE facts
+              ADD CONSTRAINT facts_source_id_fkey
+              FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE;
+          END IF;
+        END $$;
+
+        CREATE INDEX IF NOT EXISTS idx_facts_entity_active
+          ON facts(source_id, entity_slug, valid_from DESC)
+          WHERE expired_at IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_facts_session
+          ON facts(source_id, source_session, created_at DESC)
+          WHERE expired_at IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_facts_since
+          ON facts(source_id, created_at DESC)
+          WHERE expired_at IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_facts_unconsolidated
+          ON facts(source_id, entity_slug)
+          WHERE consolidated_at IS NULL AND expired_at IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_facts_embedding_hnsw
+          ON facts USING hnsw (embedding ${opclass})
+          WHERE embedding IS NOT NULL AND expired_at IS NULL;
+      `;
+
+      await engine.runMigration(40, factsDDL);
+
+      // Step 3: enable RLS on Postgres when role has BYPASSRLS (v24/v29 pattern).
+      // PGLite has no RLS engine.
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(40, `
+          DO $$
+          DECLARE
+            has_bypass BOOLEAN;
+          BEGIN
+            SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+            IF has_bypass THEN
+              ALTER TABLE facts ENABLE ROW LEVEL SECURITY;
+            END IF;
+          END $$;
+        `);
+      }
+    },
+  },
+  {
+    version: 46,
+    name: 'mcp_request_log_params_jsonb_normalize',
+    idempotent: true,
+    // v0.31.3 wave (D-codex-2 / D1): mcp_request_log.params is JSONB, but
+    // pre-v0.31.3 serve-http.ts wrote `JSON.stringify(...)` strings into it
+    // via the postgres.js template tag's loose typing. The column was
+    // technically JSONB but stored as a JSON-encoded string, so reads via
+    // `params->>'op'` returned the encoded string '"search"' instead of
+    // 'search'. The /admin/api/requests endpoint returned both shapes raw
+    // to the SPA depending on row age.
+    //
+    // The v0.31.3 commit re-routes those INSERTs through executeRawJsonb,
+    // which writes real objects. This one-shot UPDATE lifts existing
+    // string-shaped rows up to objects so the read side sees one
+    // consistent shape. Idempotent: subsequent runs find no rows where
+    // jsonb_typeof = 'string' and the UPDATE is a no-op.
+    //
+    // `params #>> '{}'` extracts the underlying string at the top level,
+    // then ::jsonb re-parses it as JSON. The `WHERE` filter guards against
+    // running on already-object rows AND limits the unwrap to strings that
+    // start with `{` (object-shaped) so a malformed legacy string can't
+    // abort the migration.
+    sql: `
+      UPDATE mcp_request_log
+        SET params = (params #>> '{}')::jsonb
+        WHERE jsonb_typeof(params) = 'string'
+          AND params #>> '{}' LIKE '{%';
+    `,
+  },
+  {
+    version: 47,
+    name: 'facts_notability_alter',
+    // v0.31.2 (B2 ship-blocker fix). Renumbered from v46 → v47 after the
+    // merge from master picked up v0.31.3's mcp_request_log_params_jsonb_normalize
+    // at v46. facts.notability column shipped via v45's inline CREATE TABLE
+    // on fresh installs, but every brain that ran v45 BEFORE notability
+    // landed in v45's blob is now missing the column. INSERT crashes with
+    // "column does not exist" on first sync after upgrade.
+    //
+    // This migration is the ALTER counterpart for those existing brains.
+    // Idempotent under all states:
+    //   - Fresh install (v45 already added column): ADD COLUMN IF NOT EXISTS
+    //     no-ops; named CHECK probe finds existing constraint → skip.
+    //   - Old brain (no column): ADD COLUMN adds it with NOT NULL DEFAULT;
+    //     named CHECK probe finds nothing → adds CHECK.
+    //   - Partial state (column exists, no CHECK): ADD COLUMN no-ops;
+    //     CHECK probe adds the named constraint.
+    //
+    // CHECK constraint is named `facts_notability_check` (named, not autogen)
+    // so the idempotency probe can find it deterministically. If v45 inline
+    // already created an autogen CHECK with identical semantics, the named
+    // one is additive and non-conflicting (Postgres allows multiple CHECKs
+    // covering the same predicate).
+    //
+    // Both engines run the same SQL — PGLite is real Postgres in WASM and
+    // supports DO $$ blocks. PGLite users with older persistent brains hit
+    // the same bug.
+    sql: `
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS notability TEXT NOT NULL DEFAULT 'medium';
+
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'facts_notability_check'
+            AND conrelid = 'facts'::regclass
+        ) THEN
+          ALTER TABLE facts ADD CONSTRAINT facts_notability_check
+            CHECK (notability IN ('high','medium','low'));
+        END IF;
+      END $$;
+    `,
+  },
+  {
+    version: 48,
+    name: 'takes_weight_round_to_grid',
+    // v0.32.0 — Takes v2 wave (renumbered from v46 → v48 after merging master's
+    // v0.31.3 wave which claimed v46 with mcp_request_log_params_jsonb_normalize).
+    // Backfill the weight column to the 0.05 grid that v0.31's engine layer
+    // enforces on insert (PR #795). Cross-modal eval over 100K production
+    // takes flagged 0.74, 0.82-style values as false precision; the engine
+    // now rounds new inserts to the grid, but pre-v0.32 rows still carry the
+    // old precision and bias every query that reads weight (search ranking,
+    // scorecard, calibration math).
+    //
+    // What `transaction: false` actually buys (codex review #2 correction):
+    // it frees the migration runner from holding a long transaction across
+    // the UPDATE so other gbrain processes (workers, MCP queries) can
+    // interleave. It does NOT enable mid-statement resume — a single SQL
+    // statement either completes or rolls back.
+    //
+    // Idempotency: the WHERE clause re-evaluates each row. After the first
+    // complete pass every row is on-grid; a second invocation of the
+    // migration is a zero-row UPDATE.
+    //
+    // The IS NOT NULL guard is cheap insurance against any stale schema
+    // where weight was nullable; current schema (v28+) has NOT NULL.
+    sql: `
+      -- Tolerance-based comparison. weight is stored as REAL (float32), which
+      -- has ~1e-7 representation noise. The 0.05 grid spacing is 5e-2. Any
+      -- value with abs(weight - on_grid) > 1e-3 is genuinely off-grid; below
+      -- that, the difference is float32 noise from prior round-trips and
+      -- re-writing it would only re-introduce the same noise, not converge.
+      -- (The naive "weight <> ROUND(...)" form fires every time because
+      -- mixed REAL/NUMERIC comparison promotes weight to DOUBLE PRECISION
+      -- first, surfacing the 1e-7 noise as inequality.)
+      UPDATE takes
+         SET weight = (ROUND(weight::numeric * 20) / 20)::real
+       WHERE weight IS NOT NULL
+         AND abs(weight::numeric - ROUND(weight::numeric * 20) / 20) > 0.001;
+    `,
+    transaction: false,
+  },
+  {
+    version: 49,
+    name: 'eval_takes_quality_runs',
+    // v0.32 — Takes v2 wave (EXP-5). Renumbered from v47 → v49 after merging
+    // master's v0.31.3 wave (v46 → mcp_request_log_params_jsonb_normalize).
+    //
+    // DB-authoritative store for the takes-quality eval CLI's receipts.
+    // Codex review #6 corrected the original two-phase plan (split-brain
+    // reconciliation gap) — DB row is the source of truth, the disk file
+    // is a best-effort artifact.
+    //
+    // 4-sha unique key (corpus, prompt, model_set, rubric) so:
+    //   - Re-running the same run is idempotent (ON CONFLICT DO NOTHING).
+    //   - A future rubric tweak produces a different rubric_sha8 → distinct
+    //     row → trend mode segregates by rubric_version (codex review #3).
+    //
+    // receipt_json carries the full receipt blob so `replay` can reconstruct
+    // when the disk artifact is missing (DB-authoritative replay path).
+    //
+    // Index `(rubric_version, created_at DESC)` matches the trend query
+    // shape: ORDER BY created_at DESC LIMIT N filtered by rubric_version.
+    sql: `
+      CREATE TABLE IF NOT EXISTS eval_takes_quality_runs (
+        id                    BIGSERIAL    PRIMARY KEY,
+        receipt_sha8_corpus   TEXT         NOT NULL,
+        receipt_sha8_prompt   TEXT         NOT NULL,
+        receipt_sha8_models   TEXT         NOT NULL,
+        receipt_sha8_rubric   TEXT         NOT NULL,
+        rubric_version        TEXT         NOT NULL,
+        verdict               TEXT         NOT NULL CHECK (verdict IN ('pass','fail','inconclusive')),
+        overall_score         REAL         NOT NULL,
+        dim_scores            JSONB        NOT NULL,
+        cost_usd              REAL         NOT NULL,
+        receipt_json          JSONB        NOT NULL,
+        receipt_disk_path     TEXT,
+        created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        UNIQUE (receipt_sha8_corpus, receipt_sha8_prompt, receipt_sha8_models, receipt_sha8_rubric)
+      );
+      CREATE INDEX IF NOT EXISTS eval_takes_quality_runs_trend_idx
+        ON eval_takes_quality_runs (rubric_version, created_at DESC);
+    `,
+  },
+  {
+    version: 50,
+    name: 'ingest_log_source_id',
+    // v0.31.2 (codex P1 #3). Renumbered from v47 → v50 after the merge from
+    // master picked up v0.31.3's v46 + the takes v2 wave's v48 + v49.
+    //
+    // facts:absorb logging (commit 13 + doctor's facts_extraction_health
+    // check in commit 12) needs source_id on ingest_log so multi-source
+    // brains can scope failure counts per source. Pre-fix the column doesn't
+    // exist; the schema.sql header even calls it out: "NOTE (v0.18.0 Step 1):
+    // ingest_log.source_id is NOT added yet — lands in v17 alongside the
+    // sync rewrite." Three years on, sync.ts writes ingest_log without
+    // source_id and doctor only checks 'default'. This migration adds the
+    // column + backfills existing rows to 'default' via NOT NULL DEFAULT.
+    //
+    // Idempotent under all states (matches v47's shape):
+    //   - Fresh install: ALTER no-ops on IF NOT EXISTS.
+    //   - Old brain (no column): ALTER adds it with NOT NULL DEFAULT 'default';
+    //     existing rows inherit the default.
+    //   - Re-run after success: IF NOT EXISTS short-circuits.
+    //
+    // Both engines run the same SQL; ingest_log is engine-agnostic.
+    sql: `
+      ALTER TABLE ingest_log ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT 'default';
+
+      CREATE INDEX IF NOT EXISTS idx_ingest_log_source_type_created
+        ON ingest_log (source_id, source_type, created_at DESC);
+    `,
+  },
+  {
+    version: 51,
+    name: 'facts_fence_columns',
+    // v0.32.2: facts join the system-of-record invariant. Markdown fences on
+    // entity pages become canonical; the facts table becomes a derived index.
+    // The fence parser keys each row by `row_num` (monotonic, append-only) and
+    // ties it back to the page it lives on via `source_markdown_slug`.
+    //
+    // Two ADD COLUMN IF NOT EXISTS + one partial UNIQUE index. ALTERs are
+    // metadata-only on PG 11+ and PGLite because the columns are NULL-DEFAULT
+    // (no rewrite). Pre-v51 rows keep NULL until the v0_32_2 orchestrator
+    // backfills them from the entity page's `## Facts` fence.
+    //
+    // Idempotent under all states (matches v50 shape):
+    //   - Fresh install: the v40 CREATE TABLE block already includes the
+    //     columns (post-v0.32.2 source); these ALTERs no-op on IF NOT EXISTS.
+    //   - v0.31.x brain mid-upgrade: ALTERs add the columns; existing rows
+    //     have NULL until backfill.
+    //   - Re-run after success: ALTERs and index creation both short-circuit.
+    //
+    // Partial UNIQUE rationale: legacy NULL row_num rows must not collide
+    // (multiple v0.31 facts about the same entity coexist before backfill).
+    // The `WHERE row_num IS NOT NULL` clause makes the constraint inert for
+    // legacy rows and fully enforced once the orchestrator assigns row_nums.
+    //
+    // Both engines run the same SQL; facts is engine-agnostic at the column
+    // level. The partial-index syntax is supported by both Postgres and
+    // PGLite. (Verified against migration v48's idx_facts_unconsolidated
+    // partial-index precedent at line 2339.)
+    sql: `
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS row_num              INTEGER;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS source_markdown_slug TEXT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_fence_key
+        ON facts (source_id, source_markdown_slug, row_num)
+        WHERE row_num IS NOT NULL;
+    `,
+  },
+  {
+    version: 52,
+    name: 'eval_contradictions_cache',
+    // v0.32.6 — P2 persistent judge cache for the contradiction probe.
+    //
+    // Composite primary key includes prompt_version + truncation_policy
+    // (Codex outside-voice fix). Without these, a prompt edit would silently
+    // serve stale verdicts to consumers. The cache key is the FULL
+    // configuration that produced the verdict; bumping any component
+    // invalidates prior entries cleanly.
+    //
+    // TTL via expires_at — readers can WHERE expires_at > now() to ignore
+    // stale rows; an explicit DELETE WHERE expires_at <= now() sweep runs
+    // periodically (lives in cache.ts orchestration, not here).
+    //
+    // verdict JSONB carries the full JudgeVerdict shape (contradicts,
+    // severity, axis, confidence, resolution_kind) so a cache hit is a
+    // complete answer without needing a second column.
+    //
+    // Idempotent across PGLite and Postgres; engine-agnostic DDL.
+    sql: `
+      CREATE TABLE IF NOT EXISTS eval_contradictions_cache (
+        chunk_a_hash       TEXT         NOT NULL,
+        chunk_b_hash       TEXT         NOT NULL,
+        model_id           TEXT         NOT NULL,
+        prompt_version     TEXT         NOT NULL,
+        truncation_policy  TEXT         NOT NULL,
+        verdict            JSONB        NOT NULL,
+        created_at         TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        expires_at         TIMESTAMPTZ  NOT NULL,
+        PRIMARY KEY (chunk_a_hash, chunk_b_hash, model_id, prompt_version, truncation_policy)
+      );
+      CREATE INDEX IF NOT EXISTS eval_contradictions_cache_expires_idx
+        ON eval_contradictions_cache (expires_at);
+    `,
+  },
+  {
+    version: 53,
+    name: 'eval_contradictions_runs',
+    // v0.32.6 — M5 time-series tracking for the contradiction probe.
+    //
+    // One row per `gbrain eval suspected-contradictions` run. The headline
+    // numbers (queries_evaluated, with_contradiction, total_flagged) plus
+    // Wilson 95% CI bounds enable `gbrain eval suspected-contradictions
+    // trend [--days N]` to plot brain consistency over time.
+    //
+    // report_json carries the full ProbeReport for replay/inspection.
+    // source_tier_breakdown is also surfaced as a top-level JSONB column
+    // so trend queries can group by tier without parsing the full report.
+    //
+    // No FK to other tables: this is an append-only metrics log, not a
+    // relational record. Trend reads filter on ran_at.
+    //
+    // Idempotent across PGLite and Postgres.
+    sql: `
+      CREATE TABLE IF NOT EXISTS eval_contradictions_runs (
+        run_id                       TEXT         PRIMARY KEY,
+        ran_at                       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        schema_version               INTEGER      NOT NULL DEFAULT 1,
+        judge_model                  TEXT         NOT NULL,
+        prompt_version               TEXT         NOT NULL,
+        queries_evaluated            INTEGER      NOT NULL,
+        queries_with_contradiction   INTEGER      NOT NULL,
+        total_contradictions_flagged INTEGER      NOT NULL,
+        wilson_ci_lower              REAL         NOT NULL,
+        wilson_ci_upper              REAL         NOT NULL,
+        judge_errors_total           INTEGER      NOT NULL,
+        cost_usd_total               REAL         NOT NULL,
+        duration_ms                  INTEGER      NOT NULL,
+        source_tier_breakdown        JSONB        NOT NULL,
+        report_json                  JSONB        NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS eval_contradictions_runs_ran_at_idx
+        ON eval_contradictions_runs (ran_at DESC);
+    `,
+  },
+  {
+    version: 54,
+    name: 'cjk_wave_pages_chunker_version_and_source_path',
+    // v0.32.7 CJK fix wave. Two new columns on `pages` so the post-upgrade
+    // reindex sweep can find markdown pages built by the old chunker AND so
+    // sync's delete/rename code can resolve frontmatter-fallback slugs by
+    // path (CJK files where path → slug is non-derivable).
+    //
+    //   chunker_version: bumped to 2 in this release. New imports populate
+    //     it; existing rows inherit DEFAULT 1. `gbrain reindex --markdown`
+    //     walks `WHERE chunker_version < 2 AND page_kind = 'markdown'`
+    //     and re-imports each, bumping the column.
+    //
+    //   source_path: import-time repo-relative path. Lets sync's delete/
+    //     rename resolve fallback slugs (`小米.md` w/ frontmatter slug →
+    //     non-path-derivable). NULL for pre-migration rows; populated on
+    //     next import / reindex.
+    //
+    // Both columns engine-agnostic. Partial indexes scope to the rows
+    // we actually query (markdown-only chunker_version; non-NULL source_path).
+    idempotent: true,
+    sql: `
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS chunker_version SMALLINT NOT NULL DEFAULT 1;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_path TEXT;
+
+      CREATE INDEX IF NOT EXISTS pages_chunker_version_idx
+        ON pages (chunker_version) WHERE page_kind = 'markdown';
+
+      CREATE INDEX IF NOT EXISTS pages_source_path_idx
+        ON pages (source_path) WHERE source_path IS NOT NULL;
+    `,
+  },
+  {
+    version: 59,
+    name: 'code_traversal_cache_v0_34',
+    // v0.34 W3b — memoization layer for code_blast / code_flow.
+    // (Originally claimed v56; renumbered to v59 on merge with master which
+    // landed query_cache_search_lite=v55, drift_watch=v56, search_telemetry=v57.)
+    //
+    // Recursive caller/callee walks on a dense (calls + imports + references)
+    // graph can fan out to 200+ nodes per call. During a plan-mode agent
+    // session that calls code_blast 5-15 times, we want hits to return
+    // <200ms instead of re-walking the same graph.
+    //
+    // The cache is correctness-safe under concurrent sync via REPEATABLE
+    // READ + xmin_max — the traversal-cache module wraps each walk in
+    // `BEGIN ISOLATION LEVEL REPEATABLE READ` and captures the snapshot's
+    // xmin_max alongside the response. On read, if the current snapshot
+    // doesn't dominate the cached snapshot, the cache misses.
+    //
+    // D3 — cluster_generation: monotonically incrementing counter bumped
+    // once per recompute_code_clusters phase. Cache rows carrying a stale
+    // generation naturally miss on next read, so cluster-renaming-mid-cycle
+    // doesn't return stale cluster names from cached blast/flow responses.
+    sql: `
+      CREATE TABLE IF NOT EXISTS code_traversal_cache (
+        id SERIAL PRIMARY KEY,
+        symbol_qualified TEXT NOT NULL,
+        depth INT NOT NULL,
+        source_id TEXT NOT NULL,
+        response_json JSONB NOT NULL,
+        max_chunk_updated_at TIMESTAMPTZ NOT NULL,
+        xmin_max BIGINT NOT NULL,
+        cluster_generation BIGINT NOT NULL DEFAULT 0,
+        computed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS code_traversal_cache_key_idx
+        ON code_traversal_cache (symbol_qualified, depth, source_id);
+      CREATE INDEX IF NOT EXISTS code_traversal_cache_source_idx
+        ON code_traversal_cache (source_id);
+    `,
+  },
+  {
+    version: 58,
+    name: 'edges_backfilled_at_v0_33_2',
+    // v0.33.2 W0c — resumable symbol-resolution backfill watermark.
+    // (Originally claimed v55; renumbered to v58 on merge with master which
+    // landed query_cache_search_lite=v55, drift_watch=v56, search_telemetry=v57.)
+    //
+    // The within-file two-pass resolver (src/core/chunkers/symbol-resolver.ts)
+    // walks every content_chunks row that has unresolved edges
+    // (rows in code_edges_symbol whose to_symbol_qualified has not been
+    // matched against same-file symbol_name_qualified yet) and writes the
+    // resolution outcome to code_edges_symbol.edge_metadata. On a 96K-chunk
+    // brain that is a 5-15 minute backfill the first time it runs.
+    //
+    // `edges_backfilled_at` is the resume watermark. Backfill runs in
+    // 200-chunk batches; on batch success the column is set to NOW() for
+    // every chunk in the batch. Resume picks up chunks where the watermark
+    // is NULL or older than EDGE_EXTRACTOR_VERSION_TS (a constant bumped
+    // when the extractor's shape changes). Crashes lose at most one batch.
+    //
+    // Composite + partial indexes for the lookup hot path (D11 from eng
+    // review):
+    //   - idx_code_edges_symbol_resolver (source_id, to_symbol_qualified)
+    //     — every code_edges_symbol row is unresolved by construction
+    //     (the table has no to_chunk_id column; that lives on code_edges_chunk).
+    //     This composite index supports the resolver's per-source lookups.
+    //   - idx_content_chunks_symbol_lookup (page_id, symbol_name_qualified)
+    //     WHERE symbol_name_qualified IS NOT NULL — file-batched lookup
+    //     used by both the resolver and the cluster recompute phase (W4-5).
+    //   - idx_content_chunks_edges_backfill (edges_backfilled_at)
+    //     WHERE edges_backfilled_at IS NULL — find unresumed rows quickly.
+    //
+    // Idempotent: IF NOT EXISTS on column + indexes. Backfill itself runs
+    // separately via the resolve_symbol_edges cycle phase.
+    sql: `
+      ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS edges_backfilled_at TIMESTAMPTZ;
+
+      CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_resolver
+        ON code_edges_symbol (source_id, to_symbol_qualified);
+
+      CREATE INDEX IF NOT EXISTS idx_content_chunks_symbol_lookup
+        ON content_chunks (page_id, symbol_name_qualified)
+        WHERE symbol_name_qualified IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_content_chunks_edges_backfill
+        ON content_chunks (edges_backfilled_at)
+        WHERE edges_backfilled_at IS NULL;
+    `,
+  },
+  {
+    version: 55,
+    name: 'query_cache_search_lite',
+    // v0.32.x (search-lite, originally claimed v52 in PR #897; renumbered
+    // to v55 on merge with master to sit after eval_contradictions_cache (v52),
+    // eval_contradictions_runs (v53), cjk_wave (v54)).
+    //
+    // Semantic query cache. Cache search results keyed by query embedding
+    // similarity so a near-duplicate query reuses the previous result set
+    // instead of re-running keyword + vector + RRF + dedup. Cache lookup:
+    // `embedding <=> $1 < 0.08` (cosine distance, similarity >= 0.92) using HNSW.
+    //
+    // Schema:
+    //   id            — SHA-256(query_text + source_id) for diagnostics.
+    //   query_text    — the raw query for debug + cache-stats output.
+    //   source_id     — scope by source so multi-source brains don't bleed.
+    //   embedding     — the query embedding. Same dim as content_chunks.
+    //   results       — JSONB array of SearchResult rows.
+    //   meta          — JSONB; what hybridSearch actually did (intent,
+    //                   vector_enabled, etc.) so cached responses can
+    //                   surface the same debug info as fresh ones.
+    //   ttl_seconds   — per-row TTL. Default 3600. Stale rows are skipped
+    //                   at read time and pruned by `gbrain cache prune`.
+    //   created_at    — TTL anchor.
+    //   hit_count     — instrumentation; bumped on each lookup-hit.
+    //   last_hit_at   — instrumentation.
+    //
+    // Schema is engine-agnostic: HALFVEC when available (matches the facts
+    // table from v45 for consistency), otherwise VECTOR. Embedding dim is
+    // resolved from `config.embedding_dimensions` at migration time so
+    // non-OpenAI brains work — same approach as v45.
+    sql: '',
+    handler: async (engine: BrainEngine) => {
+      // Step 1: resolve embedding dim from config table (same pattern as v45).
+      let embeddingDim = 1536;
+      try {
+        const dimRows = await engine.executeRaw<{ value: string }>(
+          `SELECT value FROM config WHERE key = 'embedding_dimensions'`,
+        );
+        if (dimRows.length > 0) {
+          const parsed = parseInt(dimRows[0].value, 10);
+          if (Number.isFinite(parsed) && parsed > 0 && parsed <= 4096) {
+            embeddingDim = parsed;
+          }
+        }
+      } catch {
+        // No config row yet — fall back to default.
+      }
+
+      // Step 2: pgvector version probe for HALFVEC. Same logic as v45.
+      // We deliberately mirror v45's facts table approach for consistency.
+      let useHalfvec = false;
+      if (engine.kind === 'postgres') {
+        try {
+          const vrows = await engine.executeRaw<{ extversion: string }>(
+            `SELECT extversion FROM pg_extension WHERE extname = 'vector'`,
+          );
+          if (vrows.length > 0) {
+            const v = vrows[0].extversion;
+            const parts = v.split('.');
+            const major = parseInt(parts[0] ?? '0', 10);
+            const minor = parseInt(parts[1] ?? '0', 10);
+            if (major > 0 || (major === 0 && minor >= 7)) {
+              useHalfvec = true;
+            }
+          }
+        } catch {
+          // Probe failed — fall back to VECTOR.
+        }
+      } else {
+        useHalfvec = true;
+      }
+
+      const vecType = useHalfvec ? 'HALFVEC' : 'VECTOR';
+      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+
+      const ddl = `
+        CREATE TABLE IF NOT EXISTS query_cache (
+          id            TEXT        PRIMARY KEY,
+          query_text    TEXT        NOT NULL,
+          source_id     TEXT        NOT NULL DEFAULT 'default',
+          embedding     ${vecType}(${embeddingDim}),
+          results       JSONB       NOT NULL DEFAULT '[]'::jsonb,
+          meta          JSONB       NOT NULL DEFAULT '{}'::jsonb,
+          ttl_seconds   INTEGER     NOT NULL DEFAULT 3600,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+          hit_count     INTEGER     NOT NULL DEFAULT 0,
+          last_hit_at   TIMESTAMPTZ
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_query_cache_source_created
+          ON query_cache(source_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_query_cache_embedding_hnsw
+          ON query_cache USING hnsw (embedding ${opclass})
+          WHERE embedding IS NOT NULL;
+      `;
+
+      await engine.runMigration(55, ddl);
+    },
+  },
+  {
+    version: 56,
+    name: 'query_cache_knobs_hash',
+    // v0.32.3 search-lite mode cache contamination hotfix [CDX-4].
+    //
+    // PR #897's query_cache keyed rows on (id, source_id, query_text) only.
+    // The `id` is sha256(source_id::query_text). A tokenmax search
+    // (expansion=on, limit=50) populates a row that a subsequent
+    // conservative call (no-expansion, limit=10) reads back, serving
+    // expanded-and-oversized results to a budget-tight context.
+    //
+    // Fix: extend the row key with a knobs_hash derived from the resolved
+    // search mode bundle. Lookup filters `WHERE knobs_hash = $1 AND
+    // embedding similarity < threshold`. Existing rows have NULL
+    // knobs_hash and are treated as misses (silently re-populated with
+    // the correct hash on first hit — no orphan data, no destructive
+    // migration).
+    //
+    // The PRIMARY KEY stays the existing `id` column (the SHA-256 of
+    // (source_id, query_text, knobs_hash) — the cache code re-derives
+    // it on every write, so a tokenmax write and a conservative write
+    // produce distinct `id` values and live as separate rows).
+    //
+    // Engine-agnostic; idempotent.
+    idempotent: true,
+    sql: `
+      ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS knobs_hash TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_query_cache_source_knobs_created
+        ON query_cache(source_id, knobs_hash, created_at DESC);
+    `,
+  },
+  {
+    version: 57,
+    name: 'search_telemetry_rollup',
+    // v0.32.3 search-lite: per-day rollup of search-call shape.
+    //
+    // Powers `gbrain search stats [--days N]` and `gbrain search tune` so an
+    // operator (or an agent calling tune) can reason about hit rate, intent
+    // mix, budget pressure, and result-volume averages WITHOUT pulling
+    // per-call rows.
+    //
+    // Schema math per [CDX-17]: sums + counts only, NOT averages. Read-time
+    // derives averages so concurrent ON CONFLICT writes from multiple gbrain
+    // processes accumulate correctly.
+    //
+    // Date-bucketed cache hit/miss per [CDX-18] — query_cache.hit_count is
+    // a LIFETIME counter and can't be sliced by --days. The telemetry table
+    // is the truth for windowed hit rate.
+    //
+    // PK is (date, mode, intent) so the rollup never grows past
+    // 365 days × 3 modes × 4 intents = ~4380 rows/year. Acceptable.
+    //
+    // Engine-agnostic; idempotent.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS search_telemetry (
+        date                TEXT         NOT NULL,
+        mode                TEXT         NOT NULL,
+        intent              TEXT         NOT NULL,
+        count               INTEGER      NOT NULL DEFAULT 0,
+        sum_results         INTEGER      NOT NULL DEFAULT 0,
+        sum_tokens          INTEGER      NOT NULL DEFAULT 0,
+        sum_budget_dropped  INTEGER      NOT NULL DEFAULT 0,
+        cache_hit           INTEGER      NOT NULL DEFAULT 0,
+        cache_miss          INTEGER      NOT NULL DEFAULT 0,
+        first_seen          TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        last_seen           TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        PRIMARY KEY (date, mode, intent)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_search_telemetry_date
+        ON search_telemetry (date DESC);
+    `,
+  },
+  {
+    version: 60,
+    name: 'oauth_clients_source_id_fk',
+    // v0.34.1 (#861 + D4 + D10 + D13 — P0 source-isolation leak seal).
+    //
+    // Adds oauth_clients.source_id, validates ALL existing rows can map to a
+    // real source row, backfills NULL → 'default', and installs the FK with
+    // ON DELETE SET NULL. PR #861's original migration claimed v47-v51; we
+    // re-number to v60 because the branch already shipped through v54.
+    //
+    // D10 (codex outside-voice push-back): fail loud when stale source_id
+    // rows exist instead of silently widening to NULL. Pre-fix this column
+    // didn't exist; the only way a row has source_id IS a manual SQL poke,
+    // so the stale-row branch fires only on operator-modified brains. The
+    // GBRAIN_ACCEPT_SILENT_WIDEN=1 env var is the explicit opt-in for
+    // operators who'd rather upgrade than psql-fix. Doctor surfaces orphan
+    // rows post-clean via the v0.34.x follow-up TODO.
+    //
+    // D13: backfill NULL → 'default' BEFORE the FK ADD preserves the v0.33
+    // effective behavior (legacy unscoped clients silently fell back to
+    // 'default' via serve-http.ts:929 cast). Verify 'default' exists in
+    // sources first — fresh brains have it from sources schema's default
+    // seed; brains that scripted it out would otherwise wedge here.
+    //
+    // PGLite parity via the same DO blocks. PGLite supports DO/EXCEPTION
+    // since 0.3; no engine branch needed.
+    idempotent: true,
+    sql: `
+      -- v0.34.1 (#861 + D2 + D13 — P0 source-isolation leak seal).
+      --
+      -- This migration is intentionally lean: oauth_clients.source_id did
+      -- NOT exist pre-v60, so the only state we inherit from upgrade is
+      -- "rows with NULL source_id." Backfill those to 'default' (D13:
+      -- preserves the pre-v0.34 effective fallback behavior verbatim) and
+      -- install the FK with ON DELETE SET NULL.
+      --
+      -- D10 pre-clean is NOT NEEDED here: codex flagged the silent-widen
+      -- footgun assuming source_id was an existing column with possibly-stale
+      -- values. Since the column is brand new in this migration, the only
+      -- post-backfill values are 'default' (which we just verified exists
+      -- via the FK contract) plus any NULL the backfill left untouched
+      -- because of WHERE-clause filtering — none possible. The
+      -- GBRAIN_ACCEPT_SILENT_WIDEN env-flag stays in the runner for future
+      -- migrations that need it; this one doesn't.
+
+      -- 1. Add the column. NULL for every existing row.
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS source_id TEXT;
+
+      -- 2. Backfill NULL → 'default'. Pre-v0.34 legacy clients then map
+      --    to the same source the serve-http fallback chain used to put
+      --    them in implicitly. No-op on fresh installs (no rows yet).
+      UPDATE oauth_clients SET source_id = 'default' WHERE source_id IS NULL;
+
+      -- 3. Install FK if not already present. The PGLite + Postgres fresh-
+      --    install schemas (src/core/pglite-schema.ts, src/schema.sql) now
+      --    include the FK inline on the CREATE TABLE, so this DO block
+      --    skips on fresh installs and only fires on upgrade brains where
+      --    oauth_clients was created pre-v60 without the FK. ON DELETE SET
+      --    NULL matches the original PR #861 posture; #876 later flips to
+      --    RESTRICT once federated_read provides the alternative
+      --    scope-recovery path.
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'oauth_clients_source_id_fkey'
+        ) THEN
+          ALTER TABLE oauth_clients
+            ADD CONSTRAINT oauth_clients_source_id_fkey
+            FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+
+      -- 4. Index for token-verification lookups (verifyAccessToken's JOIN
+      --    on oauth_clients.client_id → c.source_id). oauth_clients stays
+      --    small so plain CREATE INDEX (no CONCURRENTLY) is fine.
+      CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
+        ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 61,
+    name: 'oauth_clients_federated_read_column',
+    // v0.34.1 (#876): add federated_read TEXT[] for the read-side
+    // federation feature. source_id (v60) is the WRITE-authority axis;
+    // federated_read is the READ-scope axis. A client can write to ONE
+    // source while reading from N (a "WeCare L3 dept" client writes to
+    // dept-x and reads dept-x + parent canon + shared canon).
+    //
+    // Default '{}' (empty array) on column add — pre-existing rows get
+    // backfilled in v62 with an explicit CASE so the array reflects the
+    // client's current scope rather than the column default.
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[] NOT NULL DEFAULT '{}';
+    `,
+  },
+  {
+    version: 62,
+    name: 'oauth_clients_federated_read_backfill',
+    // v0.34.1 (#876, F5 — codex outside-voice fix). Backfill federated_read
+    // with explicit CASE so source_id IS NULL doesn't produce an ambiguous
+    // array containing NULL. Three cases:
+    //   - source_id IS NULL → '{}' (empty read scope; legacy unscoped
+    //     clients lost their implicit fallback in v60 backfill to 'default',
+    //     so this branch fires only when an operator explicitly NULL'd
+    //     source_id after migration).
+    //   - source_id IS NOT NULL → ARRAY[source_id] (read scope matches
+    //     write scope, the pre-federation default).
+    // Only fires on rows where federated_read is still the column default
+    // ({}). Operators who hand-set federated_read keep their config.
+    idempotent: true,
+    sql: `
+      UPDATE oauth_clients
+      SET federated_read = CASE
+        WHEN source_id IS NULL THEN '{}'::text[]
+        ELSE ARRAY[source_id]
+      END
+      WHERE federated_read = '{}'::text[];
+    `,
+  },
+  {
+    version: 63,
+    name: 'oauth_clients_federated_read_validate',
+    // v0.34.1 (#876): post-backfill validation. Every client with a
+    // non-NULL source_id should now have its source_id reflected in
+    // federated_read. Fail loud if backfill missed a row — points at a
+    // logic bug in v62's WHERE clause.
+    idempotent: true,
+    sql: `
+      DO $$
+      DECLARE
+        bad_count INT;
+      BEGIN
+        SELECT count(*) INTO bad_count FROM oauth_clients
+          WHERE source_id IS NOT NULL
+            AND NOT (source_id = ANY(federated_read));
+        IF bad_count > 0 THEN
+          RAISE EXCEPTION 'oauth_clients has % rows where source_id is not in federated_read after v62 backfill. This is a bug in v62 — re-run gbrain apply-migrations --force-retry 62.', bad_count;
+        END IF;
+      END $$;
+    `,
+  },
+  {
+    version: 64,
+    name: 'oauth_clients_source_id_fk_restrict',
+    // v0.34.1 (#876): flip the source_id FK from ON DELETE SET NULL (v60
+    // posture) to ON DELETE RESTRICT now that federated_read provides
+    // the alternative scope-loss path. Pre-fix, deleting a source could
+    // silently widen any oauth_client to super-reader (source_id → NULL).
+    // Post-flip, source delete is refused if any client references it;
+    // the operator's path is "revoke or re-scope the clients first."
+    idempotent: true,
+    sql: `
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'oauth_clients_source_id_fkey'
+        ) THEN
+          ALTER TABLE oauth_clients DROP CONSTRAINT oauth_clients_source_id_fkey;
+        END IF;
+        ALTER TABLE oauth_clients
+          ADD CONSTRAINT oauth_clients_source_id_fkey
+          FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE RESTRICT;
+      END $$;
+    `,
+  },
+  {
+    version: 65,
+    name: 'oauth_clients_federated_read_gin_index',
+    // v0.34.1 (#876): GIN index for array-containment lookups
+    // (`WHERE p.source_id = ANY(federated_read)` and similar). The five
+    // read-side ops fall back to scalar sourceId when no auth is set, so
+    // this index only matters under load on federated-scoped clients.
+    idempotent: true,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
+        ON oauth_clients USING GIN (federated_read);
+    `,
+  },
+  {
+    version: 66,
+    name: 'embed_stale_partial_index',
+    // Renumbered v58→v59→v60→v66 across merge waves:
+    //   - v58 was taken by master's v0.33.3 edges_backfilled_at.
+    //   - v59 was taken by master's v0.34.0 code_traversal_cache.
+    //   - v60-v65 were taken by master's v0.34.1 oauth_clients source-isolation cluster.
+    // All landed before this branch could ship.
+    //
+    // Partial index for `embedding IS NULL` on content_chunks.
+    //
+    // The `embed --stale` command scans for chunks missing embeddings.
+    // Without this index, the query does a full table scan of 300K+ rows
+    // to find the ~48K NULLs, taking >2 min and hitting Supabase's
+    // statement_timeout. With the partial index, the scan is instant.
+    //
+    // Also used by countStaleChunks() for the pre-flight check.
+    //
+    // Engine-aware via handler (mirrors v14): Postgres uses
+    // CREATE INDEX CONCURRENTLY to avoid the ShareLock on `content_chunks`
+    // that a plain CREATE INDEX takes for the duration of the build.
+    // On a 373K-row table this lock blocks every concurrent write (sync,
+    // embed, autopilot). CONCURRENTLY refuses to run inside a transaction
+    // AND postgres.js's multi-statement `.unsafe()` wraps in an implicit
+    // transaction, so each statement runs as a separate call. A failed
+    // CONCURRENTLY leaves an invalid index with the target name; the
+    // handler pre-drops any invalid remnant via pg_index.indisvalid.
+    // PGLite has no concurrent writers, so plain CREATE is safe.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(
+          66,
+          `DO $$ BEGIN
+             IF EXISTS (
+               SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = 'idx_chunks_embedding_null' AND NOT i.indisvalid
+             ) THEN
+               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_null';
+             END IF;
+           END $$;`
+        );
+        await engine.runMigration(
+          66,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_null
+             ON content_chunks (page_id, chunk_index)
+             WHERE embedding IS NULL;`
+        );
+      } else {
+        await engine.runMigration(
+          66,
+          `CREATE INDEX IF NOT EXISTS idx_chunks_embedding_null
+             ON content_chunks (page_id, chunk_index)
+             WHERE embedding IS NULL;`
+        );
+      }
+    },
+  },
+  {
+    version: 67,
+    name: 'facts_typed_claim_columns',
+    // v0.35.4 — typed-claim columns for trajectory queries.
+    //
+    // Adds four optional columns to `facts` so metric assertions like
+    // "$50K MRR" can be stored as (claim_metric=mrr, claim_value=50000,
+    // claim_unit=USD, claim_period=monthly) and queried chronologically
+    // by `gbrain eval trajectory` + the `find_trajectory` MCP op.
+    //
+    // All columns nullable: existing fence rows persist identically.
+    // The partial index covers only metric-bearing rows and stays
+    // zero-byte until the v0.35.4 extraction path (`src/core/facts/extract.ts`)
+    // starts emitting typed fields, so this migration is metadata-only
+    // on both engines.
+    //
+    // See plan: ~/.claude/plans/system-instruction-you-are-working-curious-jellyfish.md
+    // Locked decisions D1 (inline extension), D-CDX-7 (v66→v67 renumber).
+    idempotent: true,
+    sql: `
+      ALTER TABLE facts
+        ADD COLUMN IF NOT EXISTS claim_metric  TEXT,
+        ADD COLUMN IF NOT EXISTS claim_value   DOUBLE PRECISION,
+        ADD COLUMN IF NOT EXISTS claim_unit    TEXT,
+        ADD COLUMN IF NOT EXISTS claim_period  TEXT;
+
+      CREATE INDEX IF NOT EXISTS facts_typed_claim_idx
+        ON facts (entity_slug, claim_metric, valid_from)
+        WHERE claim_metric IS NOT NULL;
+    `,
+  },
+  {
+    version: 68,
+    name: 'calibration_profiles_v0_36',
+    // v0.36.1.0 — Hindsight calibration wave. Per-holder profile rows
+    // aggregating TakesScorecard data into qualitative pattern statements.
+    //
+    // Schema design (from plan D17/D18):
+    //   - source_id is REQUIRED — every read routes through sourceScopeOpts(ctx)
+    //     so we can never leak a profile across the v0.34.1 source-isolation
+    //     boundary. FK to sources(id) with CASCADE so source deletion cleans
+    //     up the per-source profile.
+    //   - wave_version stamps every row so `gbrain calibration --undo-wave
+    //     v0.36.1.0` can reverse just this wave's writes.
+    //   - published BOOL gates E8 team-brain mount sharing (D15 asymmetric
+    //     opt-in). Default false: nothing leaks until owner explicitly publishes.
+    //   - grade_completion REAL [0..1]: fraction of unresolved takes the
+    //     grade_takes phase actually processed before its budget cap fired
+    //     (F1 fix — dashboard shows "60% graded" badge instead of silently
+    //     reading stale data).
+    //   - voice_gate_passed + voice_gate_attempts: D11 audit columns. When
+    //     passed=false the row uses the template-fallback narrative and
+    //     surfaces for review.
+    //   - judge_model_agreement REAL: ensemble agreement on profile
+    //     generation itself (E2 applied to the meta-step).
+    //   - active_bias_tags TEXT[] with GIN index: E3 (calibration-aware
+    //     contradictions) joins on this; E7 (nudges) matches new takes against it.
+    //
+    // PGLite parity: identical DDL works since PGLite ships GIN.
+    // Idempotent across both engines.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS calibration_profiles (
+        id                      BIGSERIAL PRIMARY KEY,
+        source_id               TEXT         NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        holder                  TEXT         NOT NULL,
+        wave_version            TEXT         NOT NULL DEFAULT 'v0.36.1.0',
+        generated_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        published               BOOLEAN      NOT NULL DEFAULT false,
+        total_resolved          INTEGER      NOT NULL,
+        brier                   REAL,
+        accuracy                REAL,
+        partial_rate            REAL,
+        grade_completion        REAL         NOT NULL DEFAULT 1.0,
+        domain_scorecards       JSONB        NOT NULL,
+        pattern_statements      TEXT[]       NOT NULL,
+        voice_gate_passed       BOOLEAN      NOT NULL,
+        voice_gate_attempts     SMALLINT     NOT NULL,
+        active_bias_tags        TEXT[]       NOT NULL,
+        model_id                TEXT         NOT NULL,
+        cost_usd                NUMERIC(10,4),
+        judge_model_agreement   REAL
+      );
+      CREATE INDEX IF NOT EXISTS calibration_profiles_holder_recent_idx
+        ON calibration_profiles (source_id, holder, generated_at DESC);
+      CREATE INDEX IF NOT EXISTS calibration_profiles_bias_tags_gin
+        ON calibration_profiles USING GIN (active_bias_tags);
+      CREATE INDEX IF NOT EXISTS calibration_profiles_published_idx
+        ON calibration_profiles (source_id, published, holder)
+        WHERE published = true;
+    `,
+  },
+  {
+    version: 69,
+    name: 'take_proposals_v0_36',
+    // v0.36.1.0 — propose_takes phase queue.
+    //
+    // Schema design:
+    //   - (source_id, page_slug, content_hash, prompt_version) is the
+    //     idempotency cache (mirrors dream_verdicts in v0.23 synthesize).
+    //     Without this, every propose_takes cycle re-spends LLM tokens on
+    //     unchanged pages.
+    //   - dedup_against_fence_rows JSONB (F2 fix): records the fence state
+    //     at proposal time so we can audit "did the LLM see the existing
+    //     fence rows when it proposed?" Prevents duplicate proposals.
+    //   - proposal_run_id (CDX-4 fix): groups proposals from a single
+    //     `gbrain dream --phase propose_takes` run so --rollback <run_id>
+    //     can bulk-reject a bad-prompt run.
+    //   - predicted_brier + predicted_brier_bucket_n (E5): forecast computed
+    //     at proposal time so the queue UX shows "your historical Brier in
+    //     this bucket is 0.31" without recomputing.
+    //   - status enum guards against undefined states.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS take_proposals (
+        id                          BIGSERIAL PRIMARY KEY,
+        source_id                   TEXT         NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        page_slug                   TEXT         NOT NULL,
+        content_hash                TEXT         NOT NULL,
+        prompt_version              TEXT         NOT NULL,
+        wave_version                TEXT         NOT NULL DEFAULT 'v0.36.1.0',
+        proposed_at                 TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        proposal_run_id             TEXT         NOT NULL,
+        status                      TEXT         NOT NULL DEFAULT 'pending'
+                                                 CHECK (status IN ('pending','accepted','rejected','superseded')),
+        claim_text                  TEXT         NOT NULL,
+        kind                        TEXT         NOT NULL,
+        holder                      TEXT         NOT NULL,
+        weight                      REAL         NOT NULL,
+        domain                      TEXT,
+        dedup_against_fence_rows    JSONB,
+        model_id                    TEXT         NOT NULL,
+        acted_at                    TIMESTAMPTZ,
+        acted_by                    TEXT,
+        promoted_row_num            INTEGER,
+        predicted_brier             REAL,
+        predicted_brier_bucket_n    INTEGER
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS take_proposals_idempotency_idx
+        ON take_proposals (source_id, page_slug, content_hash, prompt_version);
+      CREATE INDEX IF NOT EXISTS take_proposals_pending_idx
+        ON take_proposals (source_id, status, proposed_at DESC)
+        WHERE status = 'pending';
+      CREATE INDEX IF NOT EXISTS take_proposals_run_id_idx
+        ON take_proposals (proposal_run_id);
+    `,
+  },
+  {
+    version: 70,
+    name: 'take_grade_cache_v0_36',
+    // v0.36.1.0 — grade_takes verdict cache.
+    //
+    // Mirrors eval_contradictions_cache (v52) pattern:
+    //   - Composite primary key (take_id, prompt_version, judge_model_id,
+    //     evidence_signature) — prompt edits OR evidence-set changes
+    //     cleanly invalidate prior verdicts.
+    //   - judge_model_id is the literal model string for single-model runs
+    //     OR 'ensemble:openai+anthropic+google' for E2 ensemble runs.
+    //   - applied BOOLEAN: did we auto-resolve based on this verdict, or
+    //     did it surface to review? D17 default-off auto-resolve means
+    //     most rows start applied=false on fresh installs.
+    //   - confidence REAL: the discretized self-reported judge confidence.
+    //     CDX-11 drift detection compares this against actual accuracy
+    //     over 90-day windows.
+    //   - wave_version for --undo-wave reversal.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS take_grade_cache (
+        take_id            BIGINT       NOT NULL,
+        prompt_version     TEXT         NOT NULL,
+        judge_model_id     TEXT         NOT NULL,
+        evidence_signature TEXT         NOT NULL,
+        wave_version       TEXT         NOT NULL DEFAULT 'v0.36.1.0',
+        graded_at          TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        verdict            TEXT         NOT NULL
+                                        CHECK (verdict IN ('correct','incorrect','partial','unresolvable')),
+        confidence         REAL         NOT NULL,
+        applied            BOOLEAN      NOT NULL DEFAULT false,
+        cost_usd           NUMERIC(10,4),
+        PRIMARY KEY (take_id, prompt_version, judge_model_id, evidence_signature)
+      );
+      CREATE INDEX IF NOT EXISTS take_grade_cache_applied_idx
+        ON take_grade_cache (take_id, applied);
+      CREATE INDEX IF NOT EXISTS take_grade_cache_wave_idx
+        ON take_grade_cache (wave_version, graded_at DESC);
+    `,
+  },
+  {
+    version: 71,
+    name: 'take_nudge_log_v0_36',
+    // v0.36.1.0 — E7 nudge log + cooldown state (D16/F3 + CDX-5).
+    //
+    // Polymorphic reference (CDX-5 fix): a nudge can fire on a
+    // canonical take (take_id set) OR on a pending proposal (proposal_id
+    // set) BEFORE the proposal gets accepted. CHECK constraint enforces
+    // exactly one is set.
+    //
+    // (take_id, nudge_pattern, fired_at DESC) index supports the cooldown
+    // probe ("did we fire this pattern for this take in the last 14 days?").
+    // Same shape works for proposal_id via the index below.
+    //
+    // channel column lets future routing (webhook/admin-spa-toast) reuse
+    // the same cooldown semantics. v0.36.1.0 ships with channel='stderr'
+    // only (multi-channel routing deferred to v0.37+).
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS take_nudge_log (
+        id              BIGSERIAL PRIMARY KEY,
+        source_id       TEXT         NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        take_id         BIGINT,
+        proposal_id     BIGINT       REFERENCES take_proposals(id) ON DELETE CASCADE,
+        nudge_pattern   TEXT         NOT NULL,
+        fired_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        channel         TEXT         NOT NULL DEFAULT 'stderr',
+        wave_version    TEXT         NOT NULL DEFAULT 'v0.36.1.0',
+        CONSTRAINT take_nudge_log_target_xor
+          CHECK ((take_id IS NOT NULL) <> (proposal_id IS NOT NULL))
+      );
+      CREATE INDEX IF NOT EXISTS take_nudge_log_take_cooldown_idx
+        ON take_nudge_log (take_id, nudge_pattern, fired_at DESC)
+        WHERE take_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS take_nudge_log_proposal_cooldown_idx
+        ON take_nudge_log (proposal_id, nudge_pattern, fired_at DESC)
+        WHERE proposal_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS take_nudge_log_wave_idx
+        ON take_nudge_log (wave_version, fired_at DESC);
+    `,
+  },
+  {
+    version: 72,
+    name: 'takes_resolved_at_trend_idx_v0_36',
+    // v0.36.1.0 — F10 perf finding. Brier-trend aggregation queries
+    // (90-day windowed scorecard) hit takes WHERE resolved_at IS NOT NULL.
+    // Without this partial index, large takes tables do full scans even
+    // when the resolved subset is small.
+    //
+    // Partial index because most takes are unresolved on fresh brains;
+    // resolution is the sparse dimension. Engine-aware via handler since
+    // Postgres benefits from CONCURRENTLY on large tables.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        // Pre-drop invalid remnant from a failed CONCURRENTLY attempt.
+        await engine.runMigration(
+          71,
+          `DO $$ BEGIN
+             IF EXISTS (
+               SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = 'takes_resolved_at_idx' AND NOT i.indisvalid
+             ) THEN
+               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS takes_resolved_at_idx';
+             END IF;
+           END $$;`
+        );
+        await engine.runMigration(
+          71,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS takes_resolved_at_idx
+             ON takes (resolved_at DESC)
+             WHERE resolved_at IS NOT NULL;`
+        );
+      } else {
+        await engine.runMigration(
+          71,
+          `CREATE INDEX IF NOT EXISTS takes_resolved_at_idx
+             ON takes (resolved_at DESC)
+             WHERE resolved_at IS NOT NULL;`
+        );
+      }
+    },
+    transaction: false,
+  },
+  {
+    version: 73,
+    name: 'think_ab_results_v0_36',
+    // v0.36.1.0 (T18 / D19) — A/B harness data for `gbrain think --ab`.
+    //
+    // Each row records one side-by-side comparison of think with vs.
+    // without --with-calibration. After 30 days of data, `gbrain
+    // calibration ab-report` aggregates win/loss across the table and
+    // surfaces a calibration_net_negative doctor warning if the
+    // with-calibration variant loses >55% of trials (n >= 20).
+    //
+    // wave_version stamped so --undo-wave can scrub these too if needed.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS think_ab_results (
+        id              BIGSERIAL PRIMARY KEY,
+        source_id       TEXT         NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        wave_version    TEXT         NOT NULL DEFAULT 'v0.36.1.0',
+        ran_at          TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        question        TEXT         NOT NULL,
+        baseline_answer TEXT         NOT NULL,
+        with_calibration_answer TEXT NOT NULL,
+        preferred       TEXT         NOT NULL CHECK (preferred IN ('baseline','with_calibration','neither','tie')),
+        model_id        TEXT,
+        notes           TEXT
+      );
+      CREATE INDEX IF NOT EXISTS think_ab_results_recent_idx
+        ON think_ab_results (source_id, ran_at DESC);
+    `,
+  },
+  {
+    version: 74,
+    name: 'eval_candidates_embedding_column',
+    // v0.36.3.0 (D16 / CDX-10): persist the resolved embedding column on
+    // each eval_candidates row so replay against a captured query uses
+    // the column that was active at capture time — not whichever column
+    // is current local default. Without this, switching
+    // `search_embedding_column` between capture and replay produces
+    // false-positive "regressions" that are just column changes.
+    //
+    // Nullable for back-compat: pre-v0.36 rows have NULL; replay treats
+    // NULL as "use current default" so existing captures keep working
+    // exactly as before the migration.
+    //
+    // Renumbered v68→v74 during the second master merge: master's
+    // v0.36.1.0 calibration wave claimed v68-v73 first. The ALTER
+    // itself is unchanged; only the slot number moved. The column is
+    // also in PGLITE_SCHEMA_SQL / src/schema.sql so fresh installs get
+    // it natively without running this migration.
+    idempotent: true,
+    sql: `
+      ALTER TABLE eval_candidates
+        ADD COLUMN IF NOT EXISTS embedding_column TEXT;
+    `,
+    // PGLite parity: same ALTER, same IF NOT EXISTS guard makes this a
+    // no-op on subsequent boots.
+    sqlFor: {
+      pglite: `
+        ALTER TABLE eval_candidates
+          ADD COLUMN IF NOT EXISTS embedding_column TEXT;
+      `,
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
@@ -1598,6 +3609,68 @@ async function checkForBlockingConnections(engine: BrainEngine): Promise<boolean
 }
 
 /**
+ * v0.30.1 (Cherry D3 / Finding F2): wrap a migration attempt in 3-attempt
+ * retry+backoff (5s/15s/45s). Retry only on statement_timeout (57014) or
+ * connection-reset patterns; other errors fail loud immediately.
+ *
+ * Before each retry: log idle-in-transaction blockers so the user knows
+ * which PID is holding the lock. After exhaustion: throw
+ * `MigrationRetryExhausted` with the named PID + suggested
+ * pg_terminate_backend command.
+ */
+async function runMigrationSQLWithRetry(
+  engine: BrainEngine,
+  m: Migration,
+  sql: string,
+): Promise<void> {
+  const { isStatementTimeoutError, isRetryableConnError } = await import('./retry-matcher.ts');
+  // GBRAIN_MIGRATE_BACKOFF_MS lets tests skip the 5s/15s/45s backoff. In
+  // production the env var is unset and the default cadence applies.
+  const fastBackoff = process.env.GBRAIN_MIGRATE_BACKOFF_MS;
+  const backoffs = fastBackoff !== undefined
+    ? [parseInt(fastBackoff, 10) || 0, parseInt(fastBackoff, 10) || 0, parseInt(fastBackoff, 10) || 0]
+    : [5000, 15000, 45000];
+  let lastErr: Error | null = null;
+  let lastBlockers: IdleBlocker[] = [];
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      // Pre-attempt diagnostic: if there are idle blockers, log them so
+      // the operator can see what we're racing against. Cherry D3.
+      if (attempt > 0) {
+        lastBlockers = await getIdleBlockers(engine);
+        if (lastBlockers.length > 0) {
+          console.warn(`  [retry ${attempt}/3] ${lastBlockers.length} idle-in-transaction blocker(s):`);
+          for (const b of lastBlockers) {
+            console.warn(`    PID ${b.pid} idle since ${b.query_start} — ${b.query.slice(0, 80)}`);
+          }
+        }
+      }
+      await runMigrationSQL(engine, m, sql);
+      return;
+    } catch (err: unknown) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      const retryable = isStatementTimeoutError(err) || isRetryableConnError(err);
+      if (!retryable || attempt === 2) {
+        // Final failure: capture blockers + throw enriched envelope when
+        // retry-eligible (named-PID UX from F2). Non-retryable errors fall
+        // through to the existing 57014 handler in runMigrations.
+        if (retryable) {
+          lastBlockers = await getIdleBlockers(engine);
+          throw new MigrationRetryExhausted(m.version, m.name, attempt + 1, lastBlockers, lastErr);
+        }
+        throw err;
+      }
+      const delay = backoffs[attempt];
+      console.warn(`  [retry ${attempt + 1}/3] ${m.name} hit ${lastErr.message.slice(0, 80)}; retrying in ${delay}ms`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  // Defensive: shouldn't reach here.
+  if (lastErr) throw lastErr;
+}
+
+/**
  * Wrap migration SQL execution with Supabase-compatible timeout.
  * Uses SET LOCAL statement_timeout inside a transaction to override
  * server-enforced timeouts (required for Supabase Postgres).
@@ -1649,6 +3722,32 @@ async function runMigrationSQL(
   }
 }
 
+/**
+ * Cheap probe: does this engine have schema migrations pending?
+ *
+ * Reads the `version` config row in a single round-trip (no schema replay,
+ * no migration apply). Used by `connectEngine` to gate `initSchema()` so
+ * short-lived CLI invocations on already-migrated brains don't pay the
+ * full bootstrap-probe + SCHEMA_SQL replay + ledger-check cost on every
+ * `gbrain stats` / `gbrain query` / `gbrain doctor`.
+ *
+ * Defensive: treats a getConfig failure (config table missing, query error)
+ * as "yes pending" so the caller falls through to the full initSchema path.
+ * Worst case on a wedged brain is one extra schema replay — same as before.
+ *
+ * Closes #651 in cooperation with the post-upgrade auto-apply hook (X1)
+ * without the perf cost #652 would have introduced on every CLI call.
+ */
+export async function hasPendingMigrations(engine: BrainEngine): Promise<boolean> {
+  try {
+    const currentStr = await engine.getConfig('version');
+    const current = parseInt(currentStr || '1', 10);
+    return current < LATEST_VERSION;
+  } catch {
+    return true;
+  }
+}
+
 export async function runMigrations(engine: BrainEngine): Promise<{ applied: number; current: number }> {
   const currentStr = await engine.getConfig('version');
   const current = parseInt(currentStr || '1', 10);
@@ -1678,22 +3777,34 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
 
     if (sql) {
       try {
-        await runMigrationSQL(engine, m, sql);
+        // v0.30.1: retry wrapper handles statement_timeout + conn-reset
+        // across 3 attempts (5s/15s/45s). Other errors throw immediately.
+        await runMigrationSQLWithRetry(engine, m, sql);
       } catch (err: unknown) {
         // Actionable diagnostics for statement timeout (Postgres error 57014).
         // Shape matches the 4-part error standard (what / why / fix / verify).
         const code = (err as { code?: string })?.code;
-        if (code === '57014') {
-          console.error(`\n❌ Migration ${m.version} (${m.name}) hit statement_timeout (SQLSTATE 57014).`);
-          console.error('');
-          console.error('   Cause: another connection holds a lock on the target table, or the');
-          console.error('   server statement_timeout (~2 min on Supabase) is too short for this DDL.');
-          console.error('');
-          console.error('   Fix:');
-          console.error('     1. gbrain doctor --locks    # find idle-in-transaction blockers');
-          console.error('     2. Terminate blocker(s) shown by step 1 via pg_terminate_backend(<pid>)');
-          console.error('     3. gbrain apply-migrations --yes  # re-run from the version that failed');
-          console.error('');
+        if (code === '57014' || err instanceof MigrationRetryExhausted) {
+          console.error(`\n❌ Migration ${m.version} (${m.name}) ${err instanceof MigrationRetryExhausted ? 'exhausted retries' : 'hit statement_timeout (SQLSTATE 57014)'}.`);
+          if (err instanceof MigrationRetryExhausted && err.lastBlockers.length > 0) {
+            const b = err.lastBlockers[0];
+            console.error('');
+            console.error(`   Likely blocker: PID ${b.pid}, idle since ${b.query_start}`);
+            console.error(`   Query: ${b.query.slice(0, 120)}`);
+            console.error('');
+            console.error(`   Recovery: psql ... -c "SELECT pg_terminate_backend(${b.pid})"`);
+            console.error('');
+          } else {
+            console.error('');
+            console.error('   Cause: another connection holds a lock on the target table, or the');
+            console.error('   server statement_timeout (~2 min on Supabase) is too short for this DDL.');
+            console.error('');
+            console.error('   Fix:');
+            console.error('     1. gbrain doctor --locks    # find idle-in-transaction blockers');
+            console.error('     2. Terminate blocker(s) shown by step 1 via pg_terminate_backend(<pid>)');
+            console.error('     3. gbrain apply-migrations --yes  # re-run from the version that failed');
+            console.error('');
+          }
           console.error('   Verify:');
           console.error('     gbrain doctor              # schema_version should match latest');
           console.error('');
@@ -1705,6 +3816,30 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     // Application-level handler (runs outside transaction for flexibility)
     if (m.handler) {
       await m.handler(engine);
+    }
+
+    // v0.30.1 (D6): post-condition probe. If a verify hook is declared, run
+    // it before bumping config.version. When verify returns false, check
+    // idempotent — if true, log + retry the same migration once; if false,
+    // throw MigrationDriftError so operator runs --skip-verify deliberately.
+    if (m.verify) {
+      const verifyOk = await m.verify(engine).catch(() => false);
+      if (!verifyOk) {
+        const idempotent = isMigrationIdempotent(m);
+        if (idempotent) {
+          console.warn(`  [${m.version}] ⚠️  verify failed; re-running idempotent migration once`);
+          if (sql) await runMigrationSQLWithRetry(engine, m, sql);
+          if (m.handler) await m.handler(engine);
+          // Best-effort: don't double-throw if second run still fails verify.
+          // Operator's next run of doctor will re-detect drift.
+        } else {
+          throw new MigrationDriftError(
+            m.version,
+            m.name,
+            `Schema does not match expected post-condition. Run with --skip-verify to force.`,
+          );
+        }
+      }
     }
 
     // Update version after both SQL and handler succeed

@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'crypto';
 import type { Page, PageInput, PageType, Chunk, SearchResult } from './types.ts';
+import type { Take, TakeKind } from './engine.ts';
 
 /**
  * SHA-256 hash a token/secret for storage. Never store plaintext tokens.
@@ -42,13 +43,38 @@ export function contentHash(page: PageInput): string {
     .digest('hex');
 }
 
+/**
+ * v0.32.8: validate a `source_id` is safe for use as a filesystem path
+ * segment AND as a SQL identifier value. Used by the per-source disk-layout
+ * fix in patterns.ts/synthesize.ts before any `join(brainDir, source_id, ...)`
+ * call, and at `putSource()` time so invalid ids never make it into the DB.
+ *
+ * Allows lowercase ASCII letters, digits, underscore, and hyphen. Rejects
+ * `..`, `/`, spaces, dots, and any non-ASCII character. Path-traversal and
+ * SQL-injection safe by construction.
+ */
+const SOURCE_ID_RE = /^[a-z0-9_-]+$/;
+export function validateSourceId(id: string): void {
+  if (!SOURCE_ID_RE.test(id)) {
+    throw new Error(`Invalid source_id "${id}" — must match ${SOURCE_ID_RE}`);
+  }
+}
+
+function readOptionalDate(raw: unknown): Date | null | undefined {
+  // Three-state read for columns that may or may not be in the SELECT
+  // projection: undefined (not selected), null (selected, NULL value),
+  // Date (selected, populated). Mirrors the v0.26.5 deleted_at pattern.
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  return new Date(raw as string);
+}
+
 export function rowToPage(row: Record<string, unknown>): Page {
-  // v0.26.5: deleted_at is optional in the SELECT projection. When the column
-  // isn't selected (legacy callers), keep the field absent on the returned object.
-  const deletedAtRaw = row.deleted_at;
-  const deletedAt = deletedAtRaw == null
-    ? (deletedAtRaw === null ? null : undefined)
-    : new Date(deletedAtRaw as string);
+  const deletedAt = readOptionalDate(row.deleted_at);
+  const effectiveDate = readOptionalDate(row.effective_date);
+  const salienceTouchedAt = readOptionalDate(row.salience_touched_at);
+  const effectiveDateSource = row.effective_date_source as Page['effective_date_source'] | undefined;
+  const importFilename = row.import_filename as string | null | undefined;
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -58,9 +84,24 @@ export function rowToPage(row: Record<string, unknown>): Page {
     timeline: row.timeline as string,
     frontmatter: (typeof row.frontmatter === 'string' ? JSON.parse(row.frontmatter) : row.frontmatter) as Record<string, unknown>,
     content_hash: row.content_hash as string | undefined,
+    // v0.29 (column added in migration v40). Old brains pre-migration return undefined.
+    emotional_weight: row.emotional_weight == null ? undefined : Number(row.emotional_weight),
     created_at: new Date(row.created_at as string),
     updated_at: new Date(row.updated_at as string),
     ...(deletedAt !== undefined && { deleted_at: deletedAt }),
+    // v0.29.1 (columns added in migration v41). Optional in SELECT projection.
+    ...(effectiveDate !== undefined && { effective_date: effectiveDate }),
+    ...(effectiveDateSource !== undefined && { effective_date_source: effectiveDateSource }),
+    ...(importFilename !== undefined && { import_filename: importFilename }),
+    ...(salienceTouchedAt !== undefined && { salience_touched_at: salienceTouchedAt }),
+    // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
+    // can thread it through getChunks / upsertChunks without defaulting to 'default'.
+    // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now
+    // projects the column (enforced by scripts/check-source-id-projection.sh).
+    // Fail-loud default to 'default' if the row genuinely lacks it (would mean
+    // an upstream caller bypassed the projection check; better to surface than
+    // silently mis-attribute).
+    source_id: (row.source_id as string | undefined) ?? 'default',
   };
 }
 
@@ -202,5 +243,78 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
   if (typeof row.source_id === 'string') {
     result.source_id = row.source_id;
   }
+  // v0.34: effective_date / effective_date_source carried through from the
+  // pages join. Same three-state read as readOptionalDate elsewhere: the
+  // field is left UNTOUCHED when the column isn't in the projection (so
+  // legacy callers see undefined), set to null when the column was selected
+  // but the page row has no date, and to YYYY-MM-DD when populated. Postgres
+  // returns Date objects via postgres.js; PGLite returns strings. Normalize
+  // to date-only ISO so downstream prompt-builders don't see noise from
+  // midnight-UTC timestamps.
+  if ('effective_date' in row) {
+    const raw = row.effective_date;
+    if (raw === null) {
+      result.effective_date = null;
+    } else if (raw instanceof Date) {
+      result.effective_date = raw.toISOString().slice(0, 10);
+    } else if (typeof raw === 'string' && raw) {
+      // Postgres TIMESTAMPTZ already serializes as "YYYY-MM-DD ..." — slice
+      // the date portion. PGLite returns the same shape via its parser.
+      result.effective_date = raw.slice(0, 10);
+    }
+  }
+  if ('effective_date_source' in row) {
+    const raw = row.effective_date_source;
+    if (raw === null) {
+      result.effective_date_source = null;
+    } else if (typeof raw === 'string' && raw) {
+      result.effective_date_source = raw;
+    }
+  }
   return result;
+}
+
+/**
+ * Convert a takes-table SQL row (joined with pages.slug AS page_slug) to the
+ * `Take` shape. Handles Date → ISO string conversion for timestamp/date columns.
+ */
+export function takeRowToTake(row: Record<string, unknown>): Take {
+  const isoOrNull = (v: unknown): string | null => {
+    if (v == null) return null;
+    if (v instanceof Date) return v.toISOString();
+    return String(v);
+  };
+  // since/until_date are TEXT (since v0.28 — DATE was too restrictive for
+  // partial dates like '2017-01' that the spec uses).
+  const dateOrNull = (v: unknown): string | null => {
+    if (v == null) return null;
+    if (v instanceof Date) return v.toISOString().slice(0, 10);
+    return String(v);
+  };
+  return {
+    id: Number(row.id),
+    page_id: Number(row.page_id),
+    page_slug: String(row.page_slug ?? ''),
+    row_num: Number(row.row_num),
+    claim: String(row.claim),
+    kind: row.kind as TakeKind,
+    holder: String(row.holder),
+    weight: Number(row.weight),
+    since_date: dateOrNull(row.since_date),
+    until_date: dateOrNull(row.until_date),
+    source: row.source == null ? null : String(row.source),
+    superseded_by: row.superseded_by == null ? null : Number(row.superseded_by),
+    active: Boolean(row.active),
+    resolved_at: isoOrNull(row.resolved_at),
+    resolved_outcome: row.resolved_outcome == null ? null : Boolean(row.resolved_outcome),
+    resolved_quality: row.resolved_quality == null
+      ? null
+      : (String(row.resolved_quality) as 'correct' | 'incorrect' | 'partial'),
+    resolved_value: row.resolved_value == null ? null : Number(row.resolved_value),
+    resolved_unit: row.resolved_unit == null ? null : String(row.resolved_unit),
+    resolved_source: row.resolved_source == null ? null : String(row.resolved_source),
+    resolved_by: row.resolved_by == null ? null : String(row.resolved_by),
+    created_at: isoOrNull(row.created_at) ?? '',
+    updated_at: isoOrNull(row.updated_at) ?? '',
+  };
 }

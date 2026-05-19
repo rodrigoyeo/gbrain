@@ -19,10 +19,11 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, utimesSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { execSync, spawn, type ChildProcess } from 'child_process';
+import { execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
 import { loadConfig } from '../core/config.ts';
+import { ChildWorkerSupervisor } from '../core/minions/child-worker-supervisor.ts';
 
 function parseArg(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -145,47 +146,64 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   const spawnManagedWorker = useMinionsDispatch && !noWorker;
 
   let stopping = false;
-  let workerProc: ChildProcess | null = null;
-  let crashCount = 0;
-  let lastWorkerStartTime = 0;
-
-  // Stable-run reset window (matches MinionSupervisor.ts:471-476 pattern). If the
-  // worker ran > 5min before exit, treat as a fresh cycle (crashCount=1) so the
-  // RSS watchdog firing hourly does NOT trip autopilot's give-up threshold after
-  // ~5 hours of healthy uptime.
-  const STABLE_RUN_RESET_MS = 5 * 60 * 1000;
+  let childSupervisor: ChildWorkerSupervisor | null = null;
 
   if (spawnManagedWorker) {
     const cliPath = resolveGbrainCliPath();
-    const startWorker = () => {
-      // Inject the RSS watchdog default (2048 MB) for the autopilot-supervised
-      // worker. Bare `gbrain jobs work` has no default; the supervisor and
-      // autopilot are the production paths that opt in.
-      const args = ['jobs', 'work', '--max-rss', '2048'];
-      const child = spawn(cliPath, args, { stdio: 'inherit', env: process.env });
-      workerProc = child;
-      lastWorkerStartTime = Date.now();
-      console.log(`[autopilot] Minions worker spawned (pid: ${child.pid}, watchdog: 2048MB)`);
-      child.on('exit', (code) => {
-        workerProc = null;
-        if (stopping) return;
-        const runDuration = Date.now() - lastWorkerStartTime;
-        if (runDuration > STABLE_RUN_RESET_MS) {
-          // Stable run — forgive prior crash history. A watchdog-driven hourly
-          // exit (the production path post-fix) lands here every time.
-          crashCount = 1;
-        } else {
-          crashCount++;
+    // Inject the RSS watchdog default (2048 MB) for the autopilot-supervised
+    // worker. Bare `gbrain jobs work` has no default; the supervisor and
+    // autopilot are the production paths that opt in.
+    childSupervisor = new ChildWorkerSupervisor({
+      cliPath,
+      args: ['jobs', 'work', '--max-rss', '2048'],
+      // process.env clone; autopilot doesn't gate shell jobs the way the
+      // standalone supervisor does (autopilot is the operator-trust path).
+      env: { ...process.env },
+      maxCrashes: 5,
+      isStopping: () => stopping,
+      onMaxCrashesExceeded: (count, max) => {
+        console.error(`[autopilot] ${count}/${max} consecutive worker crashes, giving up.`);
+        void shutdown('max_crashes');
+      },
+      onEvent: (event) => {
+        // Route ChildWorkerSupervisor events to autopilot's stderr log.
+        // Matches the prior console output shape so operators reading
+        // existing logs see the same lines.
+        if (event.kind === 'worker_spawned') {
+          console.log(
+            `[autopilot] Minions worker spawned (pid: ${event.pid}, watchdog: 2048MB${event.tini ? ', tini: active' : ''})`,
+          );
+        } else if (event.kind === 'worker_spawn_failed') {
+          console.error(
+            `[autopilot] worker spawn failed (${event.phase}): ${event.error}${event.errnoCode ? ` (code=${event.errnoCode})` : ''}`,
+          );
+        } else if (event.kind === 'worker_exited') {
+          console.error(
+            `[autopilot] worker exited code=${event.code} signal=${event.signal} after ${event.runDurationMs}ms, crashCount=${event.crashCount}, cause=${event.likelyCause}`,
+          );
+        } else if (event.kind === 'backoff') {
+          if (event.reason === 'budget_exceeded') {
+            console.error(
+              `[autopilot] clean-restart budget exceeded; backing off ${event.ms}ms before next spawn`,
+            );
+          } else if (event.reason === 'crash') {
+            console.error(
+              `[autopilot] crash backoff ${event.ms}ms (crashCount=${event.crashCount})`,
+            );
+          }
+          // reason='clean_exit' with ms:0 is the steady-state watchdog drain;
+          // logging every iteration would be noisy. Keep silent (the
+          // worker_exited line already covers the user-visible signal).
+        } else if (event.kind === 'health_warn') {
+          console.error(
+            `[autopilot] health_warn: ${event.reason} count=${event.count} window=${event.windowMs}ms`,
+          );
         }
-        if (crashCount >= 5) {
-          console.error(`[autopilot] 5 consecutive worker crashes (run ${runDuration}ms), giving up.`);
-          process.exit(1);
-        }
-        console.error(`[autopilot] worker exited code=${code} after ${runDuration}ms, restart #${crashCount} in 10s`);
-        setTimeout(startWorker, 10_000);
-      });
-    };
-    startWorker();
+      },
+    });
+    // Fire-and-forget; runs alongside the dispatch loop. shutdown() drives
+    // the child-supervisor's isStopping accessor + drain.
+    void childSupervisor.run();
   } else if (!useMinionsDispatch) {
     const why = mode === 'off'
       ? 'minion_mode=off'
@@ -206,14 +224,11 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     if (stopping) return;
     stopping = true;
     console.log(`Autopilot stopping (${sig}).`);
-    if (workerProc) {
-      try { workerProc.kill('SIGTERM'); } catch { /* already dead */ }
-      await Promise.race([
-        new Promise<void>(r => workerProc!.once('exit', () => r())),
-        new Promise<void>(r => setTimeout(() => r(), 35_000)),
-      ]);
-      if (workerProc && !workerProc.killed) {
-        try { workerProc.kill('SIGKILL'); } catch { /* already dead */ }
+    if (childSupervisor) {
+      childSupervisor.killChild('SIGTERM');
+      await childSupervisor.awaitChildExit(35_000);
+      if (childSupervisor.childAlive) {
+        childSupervisor.killChild('SIGKILL');
       }
     }
     try { unlinkSync(lockPath); } catch { /* already gone */ }
@@ -340,7 +355,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             await new Promise(r => setImmediate(r));
           },
         });
-        if (report.status === 'failed' || report.status === 'partial') {
+        // Only 'failed' (every attempted phase failed) trips the autopilot
+        // circuit breaker. 'partial' means at least one phase warned or
+        // failed while others ran — that's a soft signal, not a fatal
+        // condition. Treating 'partial' as failure here caused respawn
+        // storms under KeepAlive=true on brains where a single phase
+        // (typically `orphans`) emits a 'warn' every cycle in steady state.
+        if (report.status === 'failed') {
           cycleOk = false;
         }
         if (jsonMode) {
@@ -465,7 +486,12 @@ function writeWrapperScript(repoPath: string): string {
   const safeGbrainPath = gbrainPath.replace(/'/g, "'\\''");
   const wrapper = `#!/bin/bash
 # Auto-generated by gbrain autopilot --install
-# Sources shell profile for API keys, then runs autopilot
+# Sources shell profile for API keys, then runs autopilot.
+# zshenv is the canonical place for env vars in zsh on macOS (zshrc is for
+# interactive shells only — vars defined there don't reach this non-interactive
+# subprocess). Source it first so secrets like GBRAIN_DATABASE_URL or any
+# OPENAI/ANTHROPIC keys exported in zshenv reach autopilot.
+[ -f ~/.zshenv ] && source ~/.zshenv 2>/dev/null
 source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true
 exec '${safeGbrainPath}' autopilot --repo '${safeRepoPath}'
 `;
