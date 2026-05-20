@@ -6,12 +6,15 @@ function result(slug: string): SearchResult {
   return {
     slug,
     title: slug,
-    content: '',
     score: 1,
     chunk_id: 1,
     page_id: 1,
-    type: 'knowledge',
-  } as SearchResult;
+    type: 'concept',
+    chunk_text: '',
+    chunk_source: 'compiled_truth',
+    chunk_index: 0,
+    stale: false,
+  };
 }
 
 describe('Arkode safety gate', () => {
