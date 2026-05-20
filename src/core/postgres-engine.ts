@@ -54,6 +54,25 @@ function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+const RELAXED_KEYWORD_STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'can', 'does', 'for', 'from',
+  'how', 'i', 'in', 'is', 'it', 'of', 'or', 'our', 'should', 'the', 'to', 'use',
+  'we', 'what', 'when', 'where', 'which', 'why', 'with', 'without', 'do',
+  'cual', 'cuales', 'cuando', 'como', 'que', 'significa', 'debe', 'evitar',
+  'en', 'de', 'del', 'el', 'la', 'las', 'los', 'por', 'para', 'un', 'una', 'y',
+]);
+
+export function buildRelaxedKeywordQuery(query: string): string | null {
+  const tokens = query
+    .toLowerCase()
+    .match(/[a-z0-9áéíóúüñ-]+/gi)
+    ?.map(token => token.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/^-+|-+$/g, ''))
+    .filter(token => token.length > 2 && !RELAXED_KEYWORD_STOPWORDS.has(token)) ?? [];
+  const unique = Array.from(new Set(tokens)).slice(0, 8);
+  if (unique.length < 2) return null;
+  return unique.join(' OR ');
+}
+
 export function getPostgresSchema(dims: number = 1536, model: string = 'text-embedding-3-large'): string {
   const parsedDims = Number(dims);
   if (!Number.isInteger(parsedDims) || parsedDims <= 0) {
@@ -1073,14 +1092,25 @@ export class PostgresEngine implements BrainEngine {
 
     // Search-only timeout. SET LOCAL inside sql.begin() scopes the GUC
     // to the transaction so it can never leak onto a pooled connection.
-    const rows = await sql.begin(async sql => {
-      await sql`SET LOCAL statement_timeout = '8s'`;
-      // Arkode downstream recall gate: production search uses pgvector HNSW.
-      // Keep ef_search transaction-local so it survives transaction-mode
-      // poolers such as Supabase/Supavisor and applies only to this query.
-      await sql`SET LOCAL hnsw.ef_search = 400`;
-      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
-    });
+    const runKeywordSql = async (queryText: string) => {
+      const queryParams = [queryText, ...params.slice(1)];
+      return await sql.begin(async sql => {
+        await sql`SET LOCAL statement_timeout = '8s'`;
+        // Arkode downstream recall gate: production search uses pgvector HNSW.
+        // Keep ef_search transaction-local so it survives transaction-mode
+        // poolers such as Supabase/Supavisor and applies only to this query.
+        await sql`SET LOCAL hnsw.ef_search = 400`;
+        return await sql.unsafe(rawQuery, queryParams as Parameters<typeof sql.unsafe>[1]);
+      });
+    };
+
+    let rows = await runKeywordSql(query);
+    if (rows.length === 0) {
+      const relaxedQuery = buildRelaxedKeywordQuery(query);
+      if (relaxedQuery) {
+        rows = await runKeywordSql(relaxedQuery);
+      }
+    }
     return rows.map(rowToSearchResult);
   }
 
@@ -1357,6 +1387,11 @@ export class PostgresEngine implements BrainEngine {
 
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
+      // Arkode downstream recall gate: production search relies on pgvector HNSW.
+      // Set ef_search transaction-locally in the same transaction as the vector
+      // query so Supabase/Supavisor transaction poolers cannot drop a URL/session
+      // option before ANN candidate selection runs.
+      await sql`SET LOCAL hnsw.ef_search = 400`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
