@@ -35,6 +35,31 @@ const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
 const pendingCacheWrites = new Set<Promise<unknown>>();
 
+const ARKODE_HR_PRIVATE_QUERY_PATTERNS = [
+  /\b(payroll|vacation\s+days?|compensation|salary|salaries)\b/i,
+];
+
+const ARKODE_SENSITIVE_QUERY_PATTERNS = [
+  /\b(bank|password|api\s*token|secret|credential|private\s*key)\b/i,
+  /\bwithout\s+[^.?!]*\b(review|approval)\b/i,
+];
+
+const ARKODE_GUARDRAIL_SLUGS = new Set([
+  'rules/non-negotiables',
+  'rules/quality-gates',
+  'methodology/meso-pricing',
+]);
+
+export function applyArkodeSafetyGate(query: string, results: SearchResult[]): SearchResult[] {
+  if (ARKODE_HR_PRIVATE_QUERY_PATTERNS.some(pattern => pattern.test(query))) {
+    return [];
+  }
+  if (!ARKODE_SENSITIVE_QUERY_PATTERNS.some(pattern => pattern.test(query))) {
+    return results;
+  }
+  return results.filter(result => ARKODE_GUARDRAIL_SLUGS.has(result.slug));
+}
+
 export async function awaitPendingSearchCacheWrites(): Promise<void> {
   if (pendingCacheWrites.size === 0) return;
   await Promise.allSettled([...pendingCacheWrites]);
@@ -511,7 +536,8 @@ export async function hybridSearch(
     const noEmbedSliced = dedupResults(keywordResults).slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
-    lastResultsCount = noEmbedBudgeted.length;
+    const noEmbedSafe = applyArkodeSafetyGate(query, noEmbedBudgeted);
+    lastResultsCount = noEmbedSafe.length;
     emitMeta({
       vector_enabled: false,
       detail_resolved: detailResolved,
@@ -523,7 +549,7 @@ export async function hybridSearch(
         ? { token_budget: noEmbedBudgetMeta }
         : {}),
     });
-    return noEmbedBudgeted;
+    return noEmbedSafe;
   }
 
   // Determine query variants (optionally with expansion)
@@ -580,7 +606,8 @@ export async function hybridSearch(
     const kwSliced = dedupResults(keywordResults).slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
-    lastResultsCount = kwBudgeted.length;
+    const kwSafe = applyArkodeSafetyGate(query, kwBudgeted);
+    lastResultsCount = kwSafe.length;
     emitMeta({
       vector_enabled: false,
       detail_resolved: detailResolved,
@@ -592,7 +619,7 @@ export async function hybridSearch(
         ? { token_budget: kwBudgetMeta }
         : {}),
     });
-    return kwBudgeted;
+    return kwSafe;
   }
 
   // Merge all result lists via RRF (includes normalization + boost)
@@ -717,7 +744,8 @@ export async function hybridSearch(
   // hybridSearch enforces it too so eval-replay + eval-longmemeval see
   // the same budget behavior as the production query op.
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
-  lastResultsCount = budgeted.length;
+  const safeBudgeted = applyArkodeSafetyGate(query, budgeted);
+  lastResultsCount = safeBudgeted.length;
   emitMeta({
     vector_enabled: true,
     detail_resolved: detailResolved,
@@ -729,7 +757,7 @@ export async function hybridSearch(
       ? { token_budget: budgetMeta }
       : {}),
   });
-  return budgeted;
+  return safeBudgeted;
 }
 
 // ----------------------------------------------------------------------

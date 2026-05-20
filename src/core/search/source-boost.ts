@@ -14,6 +14,23 @@
  */
 
 export const DEFAULT_SOURCE_BOOSTS: Record<string, number> = {
+  // Arkode canonical brain pages: curated operating truth should outrank
+  // daily logs, meetings, trend radar, and generated knowledge pages when
+  // lexical fallback broadens natural-language questions.
+  'brand/': 1.8,
+  'rules/': 1.8,
+  'methodology/': 1.8,
+  'icp/': 1.8,
+  'odoo-19/': 1.8,
+  'patterns/': 1.7,
+  'references/': 1.5,
+  'company/': 1.4,
+
+  // Arkode noisy/bulk pages.
+  'daily-': 0.45,
+  'meeting-': 0.5,
+  'knowledge-': 0.55,
+
   // Curated, opinionated, high-signal — Garry's own writing
   'originals/': 1.5,
   // Reusable knowledge frameworks
